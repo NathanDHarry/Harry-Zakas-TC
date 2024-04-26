@@ -1,0 +1,1929 @@
+---
+title: "DevTimeCourse_analysis"
+author: "Nathan Harry and Christina Zakas"
+date: "4/15/2022"
+output: html_document
+---
+
+RMarkdown to analyze the transcriptional time-course project in progress by Nathan Harry and the Zakas Lab
+Written by Nathan Harry (ndharry@ncsu.edu)
+
+
+
+# Data Import and Directory setup ----
+
+```{r Packages, message=FALSE, warning=FALSE, include=FALSE}
+# Load packages and functions
+source(file = "tc_Packages.R", echo = FALSE) #Parses a file which contains all packages and functions commonly used
+
+```
+
+
+
+```{r}
+# Colors ----
+colors.streb <- c("PP" = "forestgreen", "LL" = "darkorange1", "PL" = "purple", "LP" = "magenta")
+shapes.streb <- c("PP" = 17, "LL" = 15, "PL" = 17, "LP" = 15)
+
+```
+
+
+
+```{r}
+
+## Read in metadata
+data.meta <- read.table(file = "Project_Data/Master_metadata.txt",
+                        header = TRUE,
+                        sep = "\t")
+#View(data.meta)
+## Trim metadata to project metadata
+data.meta <- data.meta[data.meta$Project == "timecourse",]
+
+## set factor levels of metadata categories
+data.meta$sampleName <- as.character(data.meta$sampleName)
+data.meta$sampleID <- as.character(paste(data.meta$sampleName, data.meta$Replicate, data.meta$seq_Run, sep = "_"))
+data.meta$Generation <- factor(data.meta$Generation, levels = c("P0", "F1"))
+data.meta$Genotype <- factor(data.meta$Genotype, levels = c("PP", "LL", "PL", "LP"))
+data.meta$crossID <- factor(data.meta$crossID, levels = unique(data.meta$crossID))
+data.meta$TissueType <- factor(data.meta$TissueType, levels = c("16cell", "blastula", "gastrula", "prototroch", "swimming", "1week"))
+data.meta$seq_Run <- factor(data.meta$seq_Run, levels = unique(data.meta$seq_Run))
+data.meta$multiFactor <- factor(paste(data.meta$Genotype, data.meta$TissueType, sep = "_"))
+
+```
+
+
+
+```{r}
+
+# Check to make sure all required files are present in the data directory
+files <- list.files(path = "Project_Data/transcripts_sf/")
+if(any(!data.meta$fileName %in% files)) { 
+  warning("Some data files are missing. Please check that all data files are present in 'Project_Data/Count_Matrices/'.")
+  warning(paste0("\nFiles missing: ", data.meta$fileName[!(data.meta$fileName %in% files)]))
+} else { print("All files present") }
+
+```
+
+
+Use Tximport to summarize transcript level quantifications to gene level counts
+```{r Tximport, include=FALSE}
+
+## Import Streblospio benedicti reference annotations, and make a transcript to gene database for tximport
+annotations.file <- ape::read.gff(file = "Project_Data/Genome_assm2.annotated_additions.gff", GFF3 = TRUE)
+annotations.gene <- dplyr::filter(annotations.file, annotations.file$type == "gene")
+annotations.gene <- tidyr::separate(data = annotations.gene, col = attributes, into = c("ID","attributes"), sep = ";", extra = "merge")
+annotations.gene$ID <- sub(pattern = "ID=", replacement = "", x = annotations.gene$ID)
+annotations.gene$gene.id <- str_extract(string = annotations.gene$attributes, pattern = "gene_id=\".{5,}\"$")
+annotations.gene$gene.id <- gsub(pattern = "\"", x = sub(pattern = "gene_id=", replacement = "", x = annotations.gene$gene.id), replacement = "")
+annotations.df <- data.frame("ID" = annotations.gene$ID,
+                             "gene" = annotations.gene$gene.id)
+annotations.tx <- dplyr::filter(annotations.file, grepl("mRNA|tRNA", annotations.file$type))
+annotations.tx <- tidyr::separate(data = annotations.tx, col = attributes, sep = ";",fill = "right", into = c("ID", "Parent", NA))
+tx2gene.df <- data.frame("tx" = stringr::str_remove(string = annotations.tx$ID, pattern = "ID="),
+                         "gene" = stringr::str_remove(string = annotations.tx$Parent, pattern = "Parent="))
+
+data.meta <- data.meta[data.meta$fileName %in% files,] ## Trim the metadata down to only include entries for files that are present in the input directory
+
+## Read in transcript quantification(s) and summarize to gene level counts
+tximported <- tximport(files = paste0("Project_Data/transcripts_sf/", data.meta$fileName),
+                       type = "salmon",
+                       txIn = TRUE,
+                       txOut = FALSE,
+                       countsFromAbundance = "lengthScaledTPM",
+                       tx2gene = tx2gene.df)
+colnames(tximported[["counts"]]) <- data.meta$sampleID
+
+# Environment clean-up:
+rm(annotations.file, annotations.tx, tx2gene.df)
+
+```
+
+
+Make a count matrix using the summarized counts from Tximport
+```{r}
+
+Count.Matrix.raw <- as.data.frame(tximported[["counts"]])
+
+# Combine any technical replicates by taking the mean of count estimates across replicates for each sample
+replicated <- data.meta$sampleName[data.meta$Replicate > 1]
+for (i in seq_along(replicated)){
+  replicates <- data.meta$sampleID[data.meta$sampleName %in% replicated[i]]
+  Count.Matrix.raw[,replicates[1]] <- rowMeans(Count.Matrix.raw[,colnames(Count.Matrix.raw) %in% replicates])
+  Count.Matrix.raw <- Count.Matrix.raw[!colnames(Count.Matrix.raw) %in% replicates[2:length(replicates)]]
+}
+
+# Round count estimates to nearest integer >> I've read that DESeq2 rounds count estimates anyway with the tximport matrix method
+Count.Matrix.raw <- round(Count.Matrix.raw, digits = 0)
+
+
+```
+
+##
+## Sample Filtering (some samples did not sequence well) ----
+##
+```{r}
+
+# Remove samples with too few reads mapped to genes
+Count.Matrix.filter <- Count.Matrix.raw[, colSums(Count.Matrix.raw) > 2000000]
+#colnames(Count.Matrix.raw)[colSums(Count.Matrix.raw) < 2000000]
+
+# Fix swapped sample adapters
+Count.Matrix.filter[,c("BayPP_swimming_1_tc1","BayYY_gastrula_1_tc1")] <- Count.Matrix.filter[,c("BayYY_gastrula_1_tc1","BayPP_swimming_1_tc1")]
+
+# Remove the trimmed samples from the metadata table
+data.meta.trim <- data.meta[data.meta$sampleID %in% colnames(Count.Matrix.filter),]
+if(ncol(Count.Matrix.filter) != nrow(data.meta.trim)) { warning("data.meta.trim has samples that are not present in Count.Matrix.filter")}
+
+```
+
+
+Make a DESeq2 compatible dataset out of the imported RNAseq count data
+```{r}
+
+# Create a DESeq2 dataset from the count matrix, metadata, and the experimental design
+DataSet <- DESeqDataSetFromMatrix(countData = Count.Matrix.filter, 
+                                  colData = data.meta.trim, 
+                                  design = ~ multiFactor)
+
+```
+
+
+Principle component analysis (PCA) visualization
+```{r}
+
+# Variance Stabilizing Transformation (VST)
+vsd <- DESeq2::vst(DataSet, blind = FALSE)
+
+# Remove selected outlier genes --- requires outlier gene analysis code block previously run!
+keep <- !rownames(vsd) %in% rownames(outlier_genes.filtered.df)[outlier_genes.filtered.df$outlier_all]
+vsd <- vsd[keep, ]
+
+# Use a custom function to perform principle component analysis
+data.PCA <- plot.data_PCA(object = vsd,
+                          intgroup = c("Genotype", "TissueType", "seq_Run"),
+                          ntop = 500,
+                          returnData = TRUE)
+#print(paste0("PC", c("1 ", "2 ", "3 ", "4 "), "variance: ", round(attr(data.PCA, "percentVar")*100, digits = 2)))
+
+#data.PCA <- data.PCA[grepl("PP|LL", data.PCA$Genotype, perl=TRUE),]
+#data.PCA <- data.PCA[grepl("tc2", data.PCA$seq_Run, perl=TRUE),]
+
+data.PCA$dup <- ifelse(data.PCA$name %in% data.meta$sampleName[duplicated(data.meta$sampleName)] & data.PCA$seq_Run == "tc2",
+                       "Round 2 Resequenced",
+                       ifelse(data.PCA$name %in% data.meta$sampleName[duplicated(data.meta$sampleName)] & data.PCA$seq_Run == "tc1" & !data.PCA$name == "LBnewL_prototroch",
+                              "Round 1 Poor Quality", "Not Resequenced"))
+
+# Use a custom function to make a plot of the PCA data (basically just ggplot2)
+PCA1_2 <- plot.PCA(data.PCA, 1, 2, colo = "Genotype", shape = "TissueType") + 
+  geom_text(aes(label=name), hjust = -0.1, vjust = -0.1, cex = 1, color = "black")
+
+ggsave(filename = "Project_Outputs/PCA_1-2_Timecourse_outlier_all_removed.jpg", 
+       plot = PCA1_2, 
+       device = "jpg", dpi = 1000,
+       width = 10, height = 7, units = "in")
+
+
+# Environment clean-up:
+rm(data.PCA, PCA1_2)
+
+
+```
+
+
+Run DESeq2 and extract results of interest
+```{r}
+
+# Differential expression analysis
+dds <- DESeq(DataSet)
+#dds <- DESeq(outlier_by_TissueTypeDataSet)
+
+# Define the statistical thresholds to be used in determining whether a gene is called as significantly differentially expressed
+alpha_p <- 0.05         # 0.05 is standard
+min_foldchange <- 1.5   # 1.5 is standard
+
+# Decide which comparisons are important to make
+#resultsNames(dds)
+
+# Set up contrasts of interest
+res <- list()
+
+  # Individual time-point contrast between PP and LL
+  res$sixteencell_PPvLL <- results(dds, contrast = c("multiFactor", "LL_16cell", "PP_16cell"), alpha = alpha_p)
+  res$blastula_PPvLL <- results(dds, contrast = c("multiFactor", "LL_blastula", "PP_blastula"), alpha = alpha_p)
+  res$gastrula_PPvLL <- results(dds, contrast = c("multiFactor", "LL_gastrula", "PP_gastrula"), alpha = alpha_p)
+  res$prototroch_PPvLL <- results(dds, contrast = c("multiFactor", "LL_prototroch", "PP_prototroch"), alpha = alpha_p)
+  res$swimming_PPvLL <- results(dds, contrast = c("multiFactor", "LL_swimming", "PP_swimming"), alpha = alpha_p)
+  res$oneweek_PPvLL <- results(dds, contrast = c("multiFactor", "LL_1week", "PP_1week"), alpha = alpha_p)
+  
+  res$sixteencell_PLvLP <- results(dds, contrast = c("multiFactor", "LP_16cell", "PL_16cell"), alpha = alpha_p)
+  #res$blastula_PLvLP <- results(dds, contrast = c("multiFactor", "LP_blastula", "PL_blastula"), alpha = alpha_p)
+  res$gastrula_PLvLP <- results(dds, contrast = c("multiFactor", "LP_gastrula", "PL_gastrula"), alpha = alpha_p)
+  #res$prototroch_PLvLP <- results(dds, contrast = c("multiFactor", "LP_prototroch", "PL_prototroch"), alpha = alpha_p)
+  res$swimming_PLvLP <- results(dds, contrast = c("multiFactor", "LP_swimming", "PL_swimming"), alpha = alpha_p)
+  #res$oneweek_PLvLP <- results(dds, contrast = c("multiFactor", "LP_1week", "PL_1week"), alpha = alpha_p)
+  
+  
+  
+  
+
+# Outlier contrasts
+res.outlier <- list()
+res.outlier$sixteen_cell <- results(dds, contrast = c("outlier_by_TissueType", "outlier_16cell", "concordant_16cell"), alpha = alpha_p)
+res.outlier$blastula <- results(dds, contrast = c("outlier_by_TissueType", "outlier_blastula", "concordant_blastula"), alpha = alpha_p)
+res.outlier$gastrula <- results(dds, contrast = c("outlier_by_TissueType", "outlier_gastrula", "concordant_gastrula"), alpha = alpha_p)
+#res.outlier$prototroch <- results(dds, contrast = c("outlier_by_TissueType", "outlier_prototroch", "concordant_prototroch"), alpha = alpha_p)
+#res.outlier$swimming <- results(dds, contrast = c("outlier_by_TissueType", "outlier_swimming", "concordant_swimming"), alpha = alpha_p)
+#res.outlier$"1week" <- results(dds, contrast = c("outlier_by_TissueType", "outlier_1week", "concordant_1week"), alpha = alpha_p)
+
+
+# Add annotations to all results (This method is very fast)
+if(all(rownames(Count.Matrix.filter) %in% annotations.df$ID)){
+  temp <- annotations.df[annotations.df$ID %in% rownames(Count.Matrix.filter),]
+  rownames(temp) <- temp$ID
+  temp <- data.frame("gene" = temp$gene, row.names = rownames(temp))
+  if(all( rownames(res[[1]]) %in% rownames(temp)) ){
+    for(j in seq_along(res)) {
+      res[[j]]$annotation <- temp[match(rownames(res[[j]]), rownames(temp)),]
+    }
+  }
+}
+
+
+```
+
+
+Filter results of the differential expression analysis
+```{r Filter_DESeq_Results}
+
+res.filtered <- list()
+for (i in seq_along(res)) {
+  temp <- res[[i]]
+  temp$use <- temp$baseMean > metadata(temp)$filterThreshold
+  temp$filter <- ifelse(is.na(temp$padj), "ind_filtered", "Considered")
+  temp$filter <- ifelse(temp$baseMean == 0, "zero_filtered", temp$filter)
+  temp$significant <- (temp$padj < alpha_p & abs(temp$log2FoldChange) > log2(min_foldchange))
+  temp$GeneID <- rownames(temp)
+  res.filtered[[names(res)[i]]] <- temp[grepl("Considered", temp$filter) & temp$use, ]
+  #res.filtered[[names(res)[i]]] <- temp
+}
+
+# Build a significant genes list
+res.DEG <- list()
+for (i in seq_along(res.filtered)) {
+  res.DEG[[names(res.filtered)[i]]] <- res.filtered[[i]][res.filtered[[i]]$use & res.filtered[[i]]$significant, ]
+}
+
+# Environment clean-up:
+rm(temp, i)
+
+
+#for(i in seq_along(res.DEG)){
+#  write.table(x = res.DEG[[i]], file = paste0("Project_Outputs/Genotype_x_stage_DEGs/", names(res.DEG)[i], "_DEGs.txt"), quote = F, sep = "\t")
+#}
+
+```
+
+
+Set up a data-frame to contain primary modes of gene expression evolutionary change
+```{r setupMaster_Results}
+
+# Create a dataframe to contain all major results per-gene
+# Include all genes
+Master_Res.df <- data.frame("GeneID" = rownames(Count.Matrix.raw),
+                            "everDE" = FALSE,
+                            "SpecificExpression" = NA,
+                            "Expressed" = NA,
+                            "Heterochronic" = NA,
+                            "JumpScore" = NA,
+                            "Jump" = NA,
+                            "Correlation" = NA,
+                            "corr.P" = NA,
+                            "PoO" = NA,
+                            "AlleleAssignment" = NA,
+                            "RegulatoryMode" = NA,
+                            "Annotation" = NA,
+                            row.names = rownames(Count.Matrix.raw))
+
+temp <- annotations.gene[annotations.gene$ID %in% rownames(Count.Matrix.raw),]
+Master_Res.df$Chromosome <- temp$seqid[order(temp$ID)]
+Master_Res.df$Position <- temp$start[order(temp$ID)]
+
+# Cross reference to DESeq results for any and all stages to see if each gene is ever significantly DE
+for( i in 1:nrow(Master_Res.df)) {
+  GeneID <- Master_Res.df$GeneID[i]
+  temp <- c()
+  for(j in seq_along(res.DEG)){
+    temp[j] <- any(grepl(pattern = GeneID, res.DEG[[j]]$GeneID))
+  }
+  Master_Res.df$everDE[i] <- any(temp)
+}
+
+# DEGs DENOMINATOR
+DENOMINATOR.DEG <- count(Master_Res.df$everDE)
+
+# Add annotations to table (This method is very fast)
+if(all(Master_Res.df$GeneID %in% annotations.df$ID)){
+  temp <- annotations.df[annotations.df$ID %in% Master_Res.df$GeneID,]
+  rownames(temp) <- temp$ID
+  temp <- data.frame("gene" = temp$gene, row.names = rownames(temp))
+  if(all(Master_Res.df$GeneID %in% rownames(temp)) ){
+    Master_Res.df$Annotation <- temp[match(Master_Res.df$GeneID, rownames(temp)),]
+  }
+}
+
+
+
+```
+
+
+
+
+
+
+
+Make a graph showing the number of DEGs and the mean l2fc magnitude at each time-point
+```{r Time_series_DE_overview}
+
+# Set up a data frame for ggplot2
+magnitude.df <- data.frame("count" = c(rep(NA, 12)),
+                           "mean_l2fc" = NA,
+                           "median_l2fc" = NA,
+                           "timepoint" = rep(c(1:6),2),
+                           "Genotype" = c(rep("PP",6), rep("LL",6)),
+                           "expressed" = NA)
+
+time_points <- c(1, 2, 3, 4, 5, 6)
+names(time_points) <- levels(data.meta.trim$TissueType)
+normalized.counts <- DESeq2::counts(dds, normalized = T)
+# Calculate the mean and median log2 fold change of all DEGs at each time point in the time-series. Also record the overall number of DEGs at each time point.
+for (j in 1:6) {
+  temp <- as.data.frame(res.DEG[[j]])
+  magnitude.df$count[j] <- nrow(temp[temp$log2FoldChange < 0,])
+  magnitude.df$count[j+6] <- nrow(temp[temp$log2FoldChange > 0,])
+  magnitude.df$mean_l2fc[j] <- colMeans(abs(as.data.frame(temp$log2FoldChange[temp$log2FoldChange < 0])))
+  magnitude.df$mean_l2fc[j+6] <- colMeans(abs(as.data.frame(temp$log2FoldChange[temp$log2FoldChange > 0])))
+  magnitude.df$median_lf2c[j] <- median(abs(temp$log2FoldChange[temp$log2FoldChange < 0]))
+  magnitude.df$median_lf2c[j+6] <- median(abs(temp$log2FoldChange[temp$log2FoldChange > 0]))
+  magnitude.df$expressed[j] <- nrow(normalized.counts[rowSums(normalized.counts[,colnames(normalized.counts) %in% data.meta.trim$sampleID[data.meta.trim$TissueType %in% names(time_points)[j] & data.meta.trim$Genotype %in% magnitude.df$Genotype[j]] ]) > 25,] )
+  magnitude.df$expressed[j+6] <- nrow(normalized.counts[rowSums(normalized.counts[,colnames(normalized.counts) %in% data.meta.trim$sampleID[data.meta.trim$TissueType %in% names(time_points)[j] & data.meta.trim$Genotype %in% magnitude.df$Genotype[j+6]] ]) > 25,] )
+  magnitude.df$totalDEG[j] <- magnitude.df$count[j] + magnitude.df$count[j+6]
+  magnitude.df$totalDEG[j+6] <- magnitude.df$count[j] + magnitude.df$count[j+6]
+  magnitude.df$totalEXPR[j] <- mean(magnitude.df$expressed[j], magnitude.df$expressed[j+6])
+  magnitude.df$totalEXPR[j+6] <- mean(magnitude.df$expressed[j], magnitude.df$expressed[j+6])
+}
+
+
+magnitude.df$DEGtoEXPR <- magnitude.df$count/magnitude.df$expressed
+magnitude.df$Genotype <- factor(magnitude.df$Genotype)
+magnitude.df$totalDEGtototalEXPR <- (magnitude.df$totalDEG/DENOMINATOR.EXPR)
+
+#Table of DEGs at each time point (directional)
+nDEG.tbl <- data.frame("PP Overexpressed" = c(rep(NA,6)),
+                       "LL Overexpressed" = c(rep(NA,6)),
+                       row.names = c("16cell", "blastula", "gastrula", "prototroch", "swimming", "1week"))
+for(j in 1:6){
+  temp <- as.data.frame(res.DEG[[j]])
+  nDEG.tbl$PP.Overexpressed[j] <- nrow(temp[temp$log2FoldChange < 0,])
+  nDEG.tbl$LL.Overexpressed[j] <- nrow(temp[temp$log2FoldChange > 0,])
+}
+write.table(nDEG.tbl, file = "Project_Outputs/nDEG_tbl.txt", sep = "\t", quote = F, row.names = T, col.names = T, eol = "\n")
+
+
+# Overview plot
+magnitude.plot <- ggplot(data = magnitude.df[magnitude.df$Genotype == "PP",], mapping = aes(x = `timepoint`, y = `totalDEGtototalEXPR`)) +
+  geom_ribbon(data = magnitude.df[magnitude.df$Genotype == "PP",],aes(ymin = (totalDEGtototalEXPR - (mean_l2fc)/90), ymax = (totalDEGtototalEXPR + (mean_l2fc)/90), fill = "Mean log2 Fold Change")) +
+  geom_ribbon(data = magnitude.df[magnitude.df$Genotype == "PP",], aes(ymin = (totalDEGtototalEXPR - (median_lf2c)/90), ymax = (totalDEGtototalEXPR + (median_lf2c)/90), fill = "Median log2 Fold Change")) +
+  geom_smooth(col = "black") +
+  scale_x_discrete(name = "Developmental Stage", limits = c("16cell", "blastula", "gastrula", "prototroch", "swimming", "1week")) +
+  labs(title = , x = "Developmental Stage", y = "Percent of Expressed Genes that are DE") +
+  scale_fill_manual(name = "Magnitude of differences", values = c("Mean log2 Fold Change" = "grey75", "Median log2 Fold Change" = "grey60")) + 
+  scale_y_continuous(labels = scales::percent) + 
+  theme(axis.text = element_text(size = 20),
+          axis.title = element_text(size = 25),
+          legend.text = element_text(size = 25),
+          legend.title = element_text(size = 25))
+
+ggsave(filename = "Project_Outputs/tc_percent_DEGs_of_expressed_legend.jpg", plot = magnitude.plot, device = "jpeg", width = 14, height = 8, dpi = 1200, units = "in")
+
+
+# Overview plot split by LL/PP
+magnitude.plot <- ggplot(data = magnitude.df, mapping = aes(x = `timepoint`, y = `DEGtoEXPR`, col = Genotype)) +
+  geom_smooth(method = "loess", formula = y ~ x, size = 1.5, linetype = 1) +
+  scale_x_continuous(name = "Time Point", 
+                       breaks = time_points, 
+                       labels = levels(data.meta.trim$TissueType),
+                       limits = c(0.9, 6.1)) +  
+  ylab("Percent of Expressed Genes that are DE\n(In each direction)") +
+  xlab("Time Point") +
+  scale_y_continuous(labels = scales::percent) + 
+  scale_color_manual(values = c("PP" = "forestgreen", "LL" = "darkorange"), labels = c("PP overexpressed", "LL overexpressed")) + 
+  theme(axis.text = element_text(size = 20),
+          axis.title = element_text(size = 25),
+          legend.text = element_text(size = 25),
+          legend.title = element_text(size = 25))
+ggsave(filename = "Project_Outputs/tc_percent_DEGs_of_expressed_directional.jpg", plot = magnitude.plot, device = "jpeg", width = 12, height = 8, dpi = 500, units = "in")
+
+write.table(magnitude.df[,c("Genotype","timepoint","expressed")], file = "Project_Outputs/genotype_expressed_genes.txt", quote = F, sep = "\t", row.names = F, col.names = T)
+write.table(magnitude.df[,c("Genotype","timepoint","count")], file = "Project_Outputs/genotype_DEGs.txt", quote = F, sep = "\t", row.names = F, col.names = T)
+
+```
+
+
+
+```{r Morph-specific_genes}
+# Make two dataframes, containing rows for all genes, and columns for all time points
+counts <- as.data.frame(DESeq2::counts(dds, normalized = T))
+
+Expr.cutoff <- DAFS_qcut(counts)
+write.(Expr.cutoff, file = "Project_Data/DAFS_qcut_thresholds.txt", sep = "\t", quote = F, row.names = T, col.names = F)
+
+fileExpr.cutoff <- read.table(file = "Project_Data/DAFS_qcut_thresholds.txt", sep = "\t", quote = "\"")
+Expr.cutoff2 <- fileExpr.cutoff$x
+names(Expr.cutoff2) <- rownames(fileExpr.cutoff)
+Expr.cutoff <- Expr.cutoff2
+
+
+mean(Expr.cutoff) # 0.303
+
+# Compare each gene's expression count in each sample to that sample's cutoff value
+samples.expressed.df <- counts[,1:ncol(counts)] > Expr.cutoff
+
+# Use per-sample cutoffs to determine if genes are expressed in more than 2 samples in each group (3-4 replicates per group/time-point)
+expr.LL <- data.frame("sixteencell" = rowCounts(samples.expressed.df[,colnames(samples.expressed.df) %in% data.meta.trim$sampleID[data.meta.trim$Genotype =="LL" & data.meta.trim$TissueType == "16cell"]]) > 2, 
+                      "blastula" = rowCounts(samples.expressed.df[,colnames(samples.expressed.df) %in% data.meta.trim$sampleID[data.meta.trim$Genotype =="LL" & data.meta.trim$TissueType == "blastula"]]) > 2, 
+                      "gastrula" = rowCounts(samples.expressed.df[,colnames(samples.expressed.df) %in% data.meta.trim$sampleID[data.meta.trim$Genotype =="LL" & data.meta.trim$TissueType == "gastrula"]]) > 2, 
+                      "prototroch" = rowCounts(samples.expressed.df[,colnames(samples.expressed.df) %in% data.meta.trim$sampleID[data.meta.trim$Genotype =="LL" & data.meta.trim$TissueType == "prototroch"]]) > 2, 
+                      "swimming" = rowCounts(samples.expressed.df[,colnames(samples.expressed.df) %in% data.meta.trim$sampleID[data.meta.trim$Genotype =="LL" & data.meta.trim$TissueType == "swimming"]]) > 2, 
+                      "oneweek" = rowCounts(samples.expressed.df[,colnames(samples.expressed.df) %in% data.meta.trim$sampleID[data.meta.trim$Genotype =="LL" & data.meta.trim$TissueType == "1week"]]) > 2,
+                      row.names = rownames(counts))
+expr.PP <- data.frame("sixteencell" = rowCounts(samples.expressed.df[,colnames(samples.expressed.df) %in% data.meta.trim$sampleID[data.meta.trim$Genotype =="PP" & data.meta.trim$TissueType == "16cell"]]) > 2, 
+                      "blastula" = rowCounts(samples.expressed.df[,colnames(samples.expressed.df) %in% data.meta.trim$sampleID[data.meta.trim$Genotype =="PP" & data.meta.trim$TissueType == "blastula"]]) > 2, 
+                      "gastrula" = rowCounts(samples.expressed.df[,colnames(samples.expressed.df) %in% data.meta.trim$sampleID[data.meta.trim$Genotype =="PP" & data.meta.trim$TissueType == "gastrula"]]) > 2, 
+                      "prototroch" = rowCounts(samples.expressed.df[,colnames(samples.expressed.df) %in% data.meta.trim$sampleID[data.meta.trim$Genotype =="PP" & data.meta.trim$TissueType == "prototroch"]]) > 2, 
+                      "swimming" = rowCounts(samples.expressed.df[,colnames(samples.expressed.df) %in% data.meta.trim$sampleID[data.meta.trim$Genotype =="PP" & data.meta.trim$TissueType == "swimming"]]) > 2, 
+                      "oneweek" = rowCounts(samples.expressed.df[,colnames(samples.expressed.df) %in% data.meta.trim$sampleID[data.meta.trim$Genotype =="PP" & data.meta.trim$TissueType == "1week"]]) > 2,
+                      row.names = rownames(counts))
+expr.ls <- list(expr.LL, expr.PP)
+names(expr.ls) <- c("expr.LL", "expr.PP")
+
+# Logical df of genes never expressed at any time point
+expr_none <- data.frame("LL" = matrixStats::rowAlls(as.matrix(expr.ls$expr.LL), value = FALSE),
+                        "PP" = matrixStats::rowAlls(as.matrix(expr.ls$expr.PP), value = FALSE),
+                        row.names = rownames(Count.Matrix.raw))
+# Genes expressed uniquely in one morph or the other, regardless of stage
+LL_exclusive <- rownames(expr_none)[!expr_none$LL & expr_none$PP]
+PP_exclusive <- rownames(expr_none)[expr_none$LL & !expr_none$PP]
+
+# Total number of genes expressed in either morph at any time -- DENOMINATOR
+DENOMINATOR.EXPR <- nrow(expr_none[!expr_none$LL | !expr_none$PP,])
+GENES.DENOMINATOR.EXPR <- rownames(expr_none[!expr_none$LL | !expr_none$PP,])
+
+# Per-stage exclusive gene counts
+stage_wise_exclusive.df <- data.frame("GeneID" = rownames(Count.Matrix.raw),
+                                      "Exclusive" = NA,
+                                      "sixteencell" = FALSE,
+                                      "blastula" = FALSE,
+                                      "gastrula" = FALSE,
+                                      "prototroch" = FALSE,
+                                      "swimming" = FALSE,
+                                      "oneweek" = FALSE)
+for (i in 1:nrow(stage_wise_exclusive.df)) {
+  stage_wise_exclusive.df$Exclusive[i] <- ifelse(stage_wise_exclusive.df$GeneID[i] %in% LL_exclusive, "LL",
+                                              ifelse(stage_wise_exclusive.df$GeneID[i] %in% PP_exclusive, "PP",
+                                                     FALSE))
+  if (stage_wise_exclusive.df$Exclusive[i] == FALSE) {next}
+  stage_wise_exclusive.df$sixteencell[i] <-  expr.ls[[paste0("expr.", stage_wise_exclusive.df$Exclusive[i])]]$sixteencell[i]
+  stage_wise_exclusive.df$blastula[i] <-  expr.ls[[paste0("expr.", stage_wise_exclusive.df$Exclusive[i])]]$blastula[i]
+  stage_wise_exclusive.df$gastrula[i] <-  expr.ls[[paste0("expr.", stage_wise_exclusive.df$Exclusive[i])]]$gastrula[i]
+  stage_wise_exclusive.df$prototroch[i] <-  expr.ls[[paste0("expr.", stage_wise_exclusive.df$Exclusive[i])]]$prototroch[i]
+  stage_wise_exclusive.df$swimming[i] <-  expr.ls[[paste0("expr.", stage_wise_exclusive.df$Exclusive[i])]]$swimming[i]
+  stage_wise_exclusive.df$oneweek[i] <-  expr.ls[[paste0("expr.", stage_wise_exclusive.df$Exclusive[i])]]$oneweek[i]
+}
+
+# Fill Master Results data-frame with results of these tests
+Master_Res.df$SpecificExpression <- stage_wise_exclusive.df$Exclusive[match(Master_Res.df$GeneID, stage_wise_exclusive.df$GeneID)]
+Master_Res.df$SpecificExpression <- ifelse(Master_Res.df$SpecificExpression == "FALSE", FALSE, TRUE)
+Master_Res.df$Expressed[Master_Res.df$SpecificExpression] <- stage_wise_exclusive.df$Exclusive[stage_wise_exclusive.df$Exclusive != "FALSE"]
+
+# Cross reference to DESeq2 results to see if these have statistical support for being DE
+nrow(Master_Res.df[Master_Res.df$SpecificExpression & Master_Res.df$everDE,])
+
+# Summary stats for presentations
+print(paste0("LL Specific Genes: ", length(LL_exclusive),""))
+print(paste0("PP Specific Genes: ", length(PP_exclusive),""))
+print(paste0("Percent of DE genes that are Morph-Specific: ", 100* round(nrow(Master_Res.df[Master_Res.df$SpecificExpression,]) / DENOMINATOR.DEG, digits = 3), "%"))
+print(paste0("Percent of Expressed genes that are Morph-Specific: ", 100* round(nrow(Master_Res.df[Master_Res.df$SpecificExpression,]) / DENOMINATOR.EXPR, digits = 3), "%"))
+
+
+# Add annotations to all results (This method is very fast)
+if(all(stage_wise_exclusive.df$GeneID %in% annotations.df$ID)){
+  temp <- annotations.df[annotations.df$ID %in% stage_wise_exclusive.df$GeneID,]
+  rownames(temp) <- temp$ID
+  temp <- data.frame("gene" = temp$gene, row.names = rownames(temp))
+  if(all(stage_wise_exclusive.df$GeneID %in% rownames(temp)) ){
+    stage_wise_exclusive.df$Annotation <- temp[match(stage_wise_exclusive.df$GeneID, rownames(temp)),]
+  }
+}
+# Write out annotations? -- STAGE SPECIFIC
+write.table(x = na.omit(stage_wise_exclusive.df$Annotation[stage_wise_exclusive.df$Exclusive == "PP" & stage_wise_exclusive.df$oneweek]), 
+            file = "Project_Outputs/stage_1week_exclusive_annotations.txt", 
+            quote = F, sep = "\t", row.names = F, col.names = F )
+
+
+PP.excGenes <- stage_wise_exclusive.df$GeneID[stage_wise_exclusive.df$Exclusive == "PP" | rowCounts(as.matrix(stage_wise_exclusive.df[,3:8])) > 4]
+LL.excGenes <- stage_wise_exclusive.df$GeneID[stage_wise_exclusive.df$Exclusive == "LL" | rowCounts(as.matrix(stage_wise_exclusive.df[,3:8])) > 4]
+
+# example genes --
+ggsave(plot = ridgeplot.geneTC(gene_ID = "Sbene_G03421") + labs(caption = "Sbene_G03421"), filename = "Project_Outputs/exclusivePP_example_ridge.png", 
+       device = "png", width = 10, height = 6)
+ggsave(plot = ridgeplot.geneTC(gene_ID = "Sbene_G15294") + labs(caption = "Sbene_G15294"), filename = "Project_Outputs/exclusiveLL_example_ridge.png", 
+       device = "png", width = 10, height = 6)
+
+ggsave(plot = plot.geneTC(gene_ID = "Sbene_G03421") + labs(caption = "Sbene_G03421"), filename = "Project_Outputs/exclusivePP_example_line.png", 
+       device = "png", width = 10, height = 6)
+ggsave(plot = plot.geneTC(gene_ID = "Sbene_G15294") + labs(caption = "Sbene_G15294"), filename = "Project_Outputs/exclusiveLL_example_line.png", 
+       device = "png", width = 10, height = 6)
+
+
+ridgeplot.geneTC(gene_ID = "Sbene_G15294") + labs(caption = "Sbene_G15294")
+
+stage_wise_exclusive.df$Annotation[stage_wise_exclusive.df$GeneID == "Sbene_G03421"]
+stage_wise_exclusive.df$Annotation[stage_wise_exclusive.df$GeneID == "Sbene_G15294"]
+
+# GRAPH of per-STAGE morph SPECIFIC gene expression
+stage_wise_ggplot.df <- data.frame("n" = c(count(stage_wise_exclusive.df$sixteencell[stage_wise_exclusive.df$Exclusive == "LL"]),
+                                           count(stage_wise_exclusive.df$sixteencell[stage_wise_exclusive.df$Exclusive == "PP"]),
+                                           count(stage_wise_exclusive.df$blastula[stage_wise_exclusive.df$Exclusive == "LL"]),
+                                           count(stage_wise_exclusive.df$blastula[stage_wise_exclusive.df$Exclusive == "PP"]),
+                                           count(stage_wise_exclusive.df$gastrula[stage_wise_exclusive.df$Exclusive == "LL"]),
+                                           count(stage_wise_exclusive.df$gastrula[stage_wise_exclusive.df$Exclusive == "PP"]),
+                                           count(stage_wise_exclusive.df$prototroch[stage_wise_exclusive.df$Exclusive == "LL"]),
+                                           count(stage_wise_exclusive.df$prototroch[stage_wise_exclusive.df$Exclusive == "PP"]),
+                                           count(stage_wise_exclusive.df$swimming[stage_wise_exclusive.df$Exclusive == "LL"]),
+                                           count(stage_wise_exclusive.df$swimming[stage_wise_exclusive.df$Exclusive == "PP"]),
+                                           count(stage_wise_exclusive.df$oneweek[stage_wise_exclusive.df$Exclusive == "LL"]),
+                                           count(stage_wise_exclusive.df$oneweek[stage_wise_exclusive.df$Exclusive == "PP"])),
+                                   "morph" = c(rep(c("LL", "PP"), 6)),
+                                   "stage" = c(rep("16cell", 2), rep("blastula", 2), rep("gastrula", 2), rep("prototroch", 2), rep("swimming", 2), rep("1week", 2)))
+
+
+stage_exclusive_counts.ggplot <- ggplot(data = stage_wise_ggplot.df, mapping = aes(x = `stage`, y = `n`, fill = `morph`)) +
+  geom_bar(stat = "identity", color = "black", position = position_dodge()) +
+  scale_fill_manual(values = c("orange", "forestgreen")) +
+  scale_x_discrete(labels = c("16cell", "blastula", "gastrula", "prototroch", "swimming", "1week")) +
+  geom_text(aes(label=`n`), vjust=-1.3, color="black",
+            position = position_dodge(0.9), size=6) +
+  scale_y_continuous(limits = c(0, max(stage_wise_ggplot.df$n) + 100)) +
+  labs(title="Number of morph-specific genes at each developmental stage",
+        x ="Stage", 
+       y = "Number of genes",
+       fill = "Developmental Morph") +
+  theme(plot.title = element_text(size = 20),
+        axis.title.x = element_text(size = 20),
+        axis.title.y = element_text(size = 20),
+        axis.text = element_text(size = 20), 
+        legend.text = element_text(size = 18),
+        legend.title = element_text(size = 20),
+        legend.position = "none")
+stage_exclusive_counts.ggplot
+ggsave(filename = "Project_Outputs/Stage_wise_exclusive_genes.jpg", plot = stage_exclusive_counts.ggplot, device = "jpeg", width = 10, height = 8, units = "in", dpi = 2000)
+
+
+
+
+
+exclusive_counts <- data.frame("number_genes" = rep(NA, 12), "mode" = c(rep("Lecithotrophic", 6), rep("Planktotrophic", 6)), "stages_alternate" = rep(c(1,2,3,4,5,6), 2))
+for (i in 1:6) {
+  exclusive_counts$number_genes[i] <- length(LL_exclusive[LL_exclusive %in% rownames(expr.LL)[MatrixGenerics::rowCounts(as.matrix(expr.LL)) == i]])
+  
+}
+for (i in 1:6) {
+  exclusive_counts$number_genes[i+6] <- length(PP_exclusive[PP_exclusive %in% rownames(expr.PP)[MatrixGenerics::rowCounts(as.matrix(expr.PP)) == i]])
+  
+}
+# Add a column with the proportion of expressed genes in each row to the number of genes ever expressed at any time point in either morph
+exclusive_counts$perc_expressed <- exclusive_counts$number_genes/DENOMINATOR.EXPR
+
+
+
+exclusive_counts.ggplot <- ggplot(data = exclusive_counts, mapping = aes(x = `stages_alternate`, y = `perc_expressed`, fill = `mode`)) +
+  geom_bar(stat = "identity", color = "black", position = position_dodge()) +
+  scale_fill_manual(values = c("orange", "forestgreen")) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 0.06)) +
+  scale_x_continuous(breaks = c(1,2,3,4,5,6), labels = c("1", "2", "3", "4", "5", "All\n(6)")) +
+  geom_text(aes(label=`number_genes`), vjust=-1.3, color="black",
+            position = position_dodge(0.9), size=6) +
+  labs(title="Percent of expressed genes expressed in only one morph\nfor each n(1-6) number of stages",
+        x ="Number of stages with morph-specific gene expression", 
+       y = "Percent of total expressed genes\n(Number of genes)",
+       fill = "Developmental Morph") +
+  theme(plot.title = element_text(size = 20),
+        axis.title.x = element_text(size = 20),
+        axis.title.y = element_text(size = 20),
+        axis.text = element_text(size = 20), 
+        legend.text = element_text(size = 18),
+        legend.title = element_text(size = 20),
+        legend.position = "none")
+exclusive_counts.ggplot
+ggsave(filename = "Project_Outputs/Stages_exclusive_genes.jpg", plot = exclusive_counts.ggplot, device = "jpeg", width = 10, height = 8, units = "in", dpi = 2000)
+
+write.table(annotations.df[annotations.df$ID %in% LL_exclusive_notable,], file = "Project_Outputs/Annotations_LLexclusive_notable.txt", quote = F, sep = "\t", col.names = T, row.names = F)
+write.table(annotations.df[annotations.df$ID %in% PP_exclusive_notable,], file = "Project_Outputs/Annotations_PPexclusive_notable.txt", quote = F, sep = "\t", col.names = T, row.names = F)
+
+
+
+
+
+
+
+```
+
+
+
+
+The package Mfuzz allows us to cluster the expression patterns of all genes in our dataset into a set number of expression pattern profiles
+```{r Mfuzz_clustering, include=FALSE}
+
+# Note: Each Genotype needs its own pData and ExpressionSet
+norm_counts <- counts(dds, normalized=T)
+
+# Genotype: PP 
+Mfuzz_mData_PP <- data.frame("multiFactor" = c("PP_16cell", "PP_blastula", "PP_gastrula", "PP_prototroch", "PP_swimming", "PP_1week"),
+                          "Genotype" = c(rep(x = "PP", 6)),
+                          "index" = c(1:6))
+rownames(Mfuzz_mData_PP) <- gsub(pattern = "PP_", replacement = "S_", Mfuzz_mData_PP$multiFactor)
+var_mData_PP <- data.frame("attribute" = colnames(Mfuzz_mData_PP),
+                       "labelDescription" = c(rep("...", ncol(Mfuzz_mData_PP))),
+                       row.names = colnames(Mfuzz_mData_PP))
+pData_PP <- AnnotatedDataFrame(data = Mfuzz_mData_PP, varMetadata = var_mData_PP)
+# average normalized sample data for replicates
+eData_PP <- as.data.frame(norm_counts[, colnames(norm_counts) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor %in% Mfuzz_mData_PP$multiFactor]])
+eData_mean_PP <- data.frame("S_16cell" = rowMeans(eData_PP[, colnames(eData_PP) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "PP_16cell"]]),
+                            "S_blastula" = rowMeans(eData_PP[, colnames(eData_PP) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "PP_blastula"]]),
+                            "S_gastrula" = rowMeans(eData_PP[, colnames(eData_PP) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "PP_gastrula"]]),
+                            "S_prototroch" = rowMeans(eData_PP[, colnames(eData_PP) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "PP_prototroch"]]),
+                            "S_swimming" = rowMeans(eData_PP[, colnames(eData_PP) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "PP_swimming"]]),
+                            "S_1week" = rowMeans(eData_PP[, colnames(eData_PP) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "PP_1week"]]),
+                            row.names = rownames(eData_PP))
+# Test: remove zeros
+#eData_mean_PP <- eData_mean_PP[rowSums(eData_mean_PP) > 5,]
+
+eset_PP <- ExpressionSet(assayData = as.matrix(eData_mean_PP),
+                      phenoData = pData_PP)
+eset_PP.f <- Mfuzz::filter.std(eset = eset_PP, min.std = 0.0001)
+eset_PP.fs <- Mfuzz::standardise(eset = eset_PP.f)
+
+
+clusters_PP <- Mfuzz::mfuzz(eset = eset_PP.fs, centers = 8, m = mestimate(eset_PP.fs))
+clusters <- clusters_PP$centers
+
+pdf(file = "Project_Outputs/Mfuzz.pdf")
+Mfuzz::mfuzz.plot(eset = eset_PP.fs, cl = clusters_PP, mfrow = c(2,4), new.window = FALSE, min.mem = 0.7, time.labels = names(time_points))
+dev.off()
+
+Mfuzz::mfuzz.plot2(eset = eset_PP.fs, cl = clusters_PP, mfrow = c(2,4), x11 = FALSE)
+Mfuzz::mfuzz.plot2(eset = eset_PP.fs, cl = clusters_PP, mfrow = c(2,4), x11 = FALSE, centre = TRUE, centre.col = "black")
+Mfuzz::mfuzz.plot2(eset = eset_PP.fs, cl = clusters_PP, mfrow = c(2,4), x11 = FALSE, centre = TRUE, centre.col = "black", time.labels = c("16cell", "blastula", "gastrula", 
+                                                                                                                                          "prototroch", "swimming", "1week"))
+
+# Genotype: LL
+Mfuzz_mData_LL <- data.frame("multiFactor" = c("LL_16cell", "LL_blastula", "LL_gastrula", "LL_prototroch", "LL_swimming", "LL_1week"),
+                          "Genotype" = c(rep("LL", 6)),
+                          "index" = c(1:6))
+rownames(Mfuzz_mData_LL) <- gsub(pattern = "LL_", replacement = "S_", Mfuzz_mData_LL$multiFactor)
+var_mData_LL <- data.frame("attribute" = colnames(Mfuzz_mData_LL),
+                       "labelDescription" = c(rep("...", ncol(Mfuzz_mData_LL))),
+                       row.names = colnames(Mfuzz_mData_LL))
+pData_LL <- AnnotatedDataFrame(data = Mfuzz_mData_LL, varMetadata = var_mData_LL)
+# average normalized sample data for replicates
+eData_LL <- as.data.frame(norm_counts[, colnames(norm_counts) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor %in% Mfuzz_mData_LL$multiFactor]])
+eData_mean_LL <- data.frame("S_16cell" = rowMeans(eData_LL[, colnames(eData_LL) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "LL_16cell"]]),
+                            "S_blastula" = rowMeans(eData_LL[, colnames(eData_LL) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "LL_blastula"]]),
+                            "S_gastrula" = rowMeans(eData_LL[, colnames(eData_LL) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "LL_gastrula"]]),
+                            "S_prototroch" = rowMeans(eData_LL[, colnames(eData_LL) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "LL_prototroch"]]),
+                            "S_swimming" = rowMeans(eData_LL[, colnames(eData_LL) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "LL_swimming"]]),
+                            "S_1week" = rowMeans(eData_LL[, colnames(eData_LL) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "LL_1week"]]),
+                            row.names = rownames(eData_LL))
+# Test: remove zeros
+#eData_mean_LL <- eData_mean_LL[rowSums(eData_mean_LL) > 5,]
+
+eset_LL <- ExpressionSet(assayData = as.matrix(eData_mean_LL),
+                      phenoData = pData_LL)
+eset_LL.f <- Mfuzz::filter.std(eset = eset_LL, min.std = 0.0001)
+eset_LL.fs <- Mfuzz::standardise(eset = eset_LL.f)
+clusters_LL <- Mfuzz::mfuzz(eset = eset_LL.fs, centers = 8, m = mestimate(eset_LL.fs))
+
+Mfuzz::mfuzz.plot2(eset = eset_LL.fs, cl = clusters_LL, mfrow = c(2,5), x11 = FALSE)
+Mfuzz::mfuzz.plot2(eset = eset_LL.fs, cl = clusters_LL, mfrow = c(2,5), x11 = FALSE, centre = TRUE, centre.col = "black")
+Mfuzz::mfuzz.plot2(eset = eset_LL.fs, cl = clusters_LL, mfrow = c(1,3), x11 = FALSE, centre = TRUE, centre.col = "black", time.labels = c("16cell", "blastula", "gastrula", 
+                                                                                                                                          "prototroch", "swimming", "1week"))
+# Compare to PP clusters
+LL_membership <- Mfuzz::membership(exprs(eset_LL.fs), clusters = clusters, m = mestimate(eset_LL.fs))
+colnames(LL_membership) <- c(1:8)
+?Mfuzz::membership
+
+acore_clusters <- Mfuzz::acore(eset = eset_PP.fs, cl = clusters_PP, min.acore = 0.85)
+names(acore_clusters) <- c("c1","c2","c3","c4","c5","c6","c7","c8")#,"c9","c10","c11","c12")
+
+c1 <- acore_clusters$c1$NAME[which.max(acore_clusters$c1$MEM.SHIP)]
+c2 <- acore_clusters$c2$NAME[which.max(acore_clusters$c2$MEM.SHIP)]
+c3 <- acore_clusters$c3$NAME[which.max(acore_clusters$c3$MEM.SHIP)]
+c4 <- acore_clusters$c4$NAME[which.max(acore_clusters$c4$MEM.SHIP)]
+c5 <- acore_clusters$c5$NAME[which.max(acore_clusters$c5$MEM.SHIP)]
+c6 <- acore_clusters$c6$NAME[which.max(acore_clusters$c6$MEM.SHIP)]
+c7 <- acore_clusters$c7$NAME[which.max(acore_clusters$c7$MEM.SHIP)]
+c8 <- acore_clusters$c8$NAME[which.max(acore_clusters$c8$MEM.SHIP)]
+c9 <- acore_clusters$c9$NAME[which.max(acore_clusters$c9$MEM.SHIP)]
+c10 <- acore_clusters$c10$NAME[which.max(acore_clusters$c10$MEM.SHIP)]
+c11 <- acore_clusters$c11$NAME[which.max(acore_clusters$c11$MEM.SHIP)]
+c12 <- acore_clusters$c12$NAME[which.max(acore_clusters$c12$MEM.SHIP)]
+
+# Function to plot cluster cores for switches
+plot.cluster_switch <- function(clusterPP, clusterLL, ds.object=dds, metadata=data.meta.trim){
+  time_points <- c(1, 2, 3, 4, 5, 6)
+  names(time_points) <- levels(metadata$TissueType)
+  
+  countsPP <- DESeq2::counts(ds.object, normalized = T)[clusterPP, metadata$sampleID[grepl("^PP$", metadata$Genotype, perl=T)]]
+  countsLL <- DESeq2::counts(ds.object, normalized = T)[clusterLL, metadata$sampleID[grepl("^PP$", metadata$Genotype, perl=T)]]
+  
+  tc_gene.df <- data.frame("names" = c(names(countsPP), names(countsLL)),
+                           "norm_counts" = c(countsPP, countsLL),
+                           "Genotype" = c(rep("PP", length(countsPP)), rep("LL", length(countsLL))),
+                           "TissueType" = NA)
+  for(i in 1:nrow(tc_gene.df)) {
+    tc_gene.df$TissueType[i] <- as.numeric(time_points[metadata$TissueType[grepl(pattern = tc_gene.df$names[i], metadata$sampleID)]])
+  }
+  
+  
+  d <- ggplot(data = tc_gene.df, mapping = aes(x = TissueType, y = norm_counts, col = Genotype)) +
+    geom_smooth(method = "loess", formula = y ~ x, size = 3) +
+    scale_x_continuous(name = "Developmental Stage", 
+                       breaks = time_points, 
+                       labels = levels(metadata$TissueType),
+                       limits = c(0.9, 6.1)) +
+    scale_y_continuous(name = paste0("Normalized gene expression (count)")) +
+    scale_color_manual(values = c("PP" = "forestgreen", "LL" = "orange")) +
+    theme(axis.text = element_text(size = 20),
+          axis.title = element_text(size = 25),
+          legend.text = element_text(size = 25),
+          legend.title = element_text(size = 25),
+          legend.position = "none")
+  
+  return(d)
+}
+
+switch54 <- plot.cluster_switch(clusterPP = c5, clusterLL = c4)
+switch13 <- plot.cluster_switch(clusterPP = c1, clusterLL = c3)
+#switch15 <- plot.cluster_switch(clusterPP = c1, clusterLL = c5)
+
+switch21 <- plot.cluster_switch(clusterPP = c2, clusterLL = c1)
+switch31 <- plot.cluster_switch(clusterPP = c3, clusterLL = c1)
+switch32 <- plot.cluster_switch(clusterPP = c3, clusterLL = c2)
+
+
+
+ggsave(filename = "Project_Outputs/cluster_switch54.jpeg", plot = switch54, device = "jpeg", dpi = 2000, width = 10, height = 8, units = "in")
+ggsave(filename = "Project_Outputs/cluster_switch13.jpeg", plot = switch13, device = "jpeg", dpi = 2000, width = 10, height = 8, units = "in")
+#ggsave(filename = "Project_Outputs/cluster_switch15.jpeg", plot = switch15, device = "jpeg", dpi = 2000, width = 10, height = 8, units = "in")
+
+ggsave(filename = "Project_Outputs/cluster_switch21.jpeg", plot = switch21, device = "jpeg", dpi = 500, width = 10, height = 8, units = "in")
+ggsave(filename = "Project_Outputs/cluster_switch31.jpeg", plot = switch31, device = "jpeg", dpi = 500, width = 10, height = 8, units = "in")
+ggsave(filename = "Project_Outputs/cluster_switch32.jpeg", plot = switch32, device = "jpeg", dpi = 500, width = 10, height = 8, units = "in")
+
+
+# Genotype: PL
+Mfuzz_mData_PL <- data.frame("multiFactor" = c("PL_16cell", "PL_blastula", "PL_gastrula", "PL_prototroch", "PL_swimming", "PL_1week"),
+                          "Genotype" = c(rep("PL", 6)),
+                          "index" = c(1:6))
+rownames(Mfuzz_mData_PL) <- gsub(pattern = "PL_", replacement = "S_", Mfuzz_mData_PL$multiFactor)
+var_mData_PL <- data.frame("attribute" = colnames(Mfuzz_mData_PL),
+                       "labelDescription" = c(rep("...", ncol(Mfuzz_mData_PL))),
+                       row.names = colnames(Mfuzz_mData_PL))
+pData_PL <- AnnotatedDataFrame(data = Mfuzz_mData_PL, varMetadata = var_mData_PL)
+# average normalized sample data for replicates
+eData_PL <- as.data.frame(norm_counts[, colnames(norm_counts) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor %in% Mfuzz_mData_PL$multiFactor]])
+eData_mean_PL <- data.frame("S_16cell" = rowMeans(eData_PL[, colnames(eData_PL) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "PL_16cell"]]),
+                            "S_blastula" = rowMeans(eData_PL[, colnames(eData_PL) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "PL_blastula"]]),
+                            "S_gastrula" = rowMeans(eData_PL[, colnames(eData_PL) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "PL_gastrula"]]),
+                            "S_prototroch" = rowMeans(eData_PL[, colnames(eData_PL) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "PL_prototroch"]]),
+                            "S_swimming" = rowMeans(eData_PL[, colnames(eData_PL) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "PL_swimming"]]),
+                            "S_1week" = rowMeans(eData_PL[, colnames(eData_PL) %in% data.meta.trim$sampleID[data.meta.trim$multiFactor == "PL_1week"]]),
+                            row.names = rownames(eData_PL))
+# Test: remove zeros
+eData_mean_PL <- eData_mean_PL[rowSums(eData_mean_PL) > 5,]
+
+eset_PL <- ExpressionSet(assayData = as.matrix(eData_mean_PL),
+                      phenoData = pData_PL)
+eset_PL.f <- Mfuzz::filter.std(eset = eset_PL, min.std = 0.0001)
+eset_PL.fs <- Mfuzz::standardise(eset = eset_PL.f)
+clusters_PL <- Mfuzz::mfuzz(eset = eset_PL.fs, centers = 3, m = mestimate(eset_PL.fs))
+
+Mfuzz::mfuzz.plot2(eset = eset_PL.fs, cl = clusters_PL, mfrow = c(2,5), x11 = FALSE)
+Mfuzz::mfuzz.plot2(eset = eset_PL.fs, cl = clusters_PL, mfrow = c(2,5), x11 = FALSE, centre = TRUE, centre.col = "black")
+Mfuzz::mfuzz.plot2(eset = eset_PL.fs, cl = clusters_PL, mfrow = c(3,4), x11 = FALSE, centre = TRUE, centre.col = "black", time.labels = c("16cell", "blastula", "gastrula", 
+                                                                                                                                          "prototroch", "swimming", "1week"))
+
+# Compare PL to PP clusters
+PL_membership <- Mfuzz::membership(as.matrix(eset_PL.fs), clusters = clusters, m = mestimate(eset_PL.fs))
+colnames(PL_membership) <- c(1:3)
+Mfuzz::acore(eset = eset_PL.fs, cl = clusters_PP, min.acore = 0.2)
+
+# Genotype: LP -- Will need to downsize all the data sets to 3 time points to be able to include LP
+
+
+
+##  Cluster Switching:
+# Find genes that are common among all three: PP PL LL --- Note this leaves out genes that are not expressed in any ONE of the datasets included
+common_gene_list <- intersect(rownames(clusters_PP$membership), rownames(LL_membership))
+cluster_assignment <- data.frame("GeneID" = common_gene_list,
+                "PP_cluster" = NA,
+                "PP_membership" = NA,
+                "LL_cluster" = NA,
+                "LL_membership" = NA,
+                "Switch" = NA,
+                "annotation" = NA,
+                row.names = common_gene_list)
+
+threshold <- 0.7
+
+for (i in 1:nrow(cluster_assignment)) {
+  GeneID <- cluster_assignment$GeneID[i]
+  PP.index <- grepl(pattern = paste0("^",GeneID,"$"), x = rownames(clusters_PP$membership))
+  #PL.index <- grepl(pattern = paste0("^",GeneID,"$"), x = rownames(PL_membership))
+  LL.index <- grepl(pattern = paste0("^",GeneID,"$"), x = rownames(LL_membership))
+  temp.PP <- list()
+  temp.LL <- list()
+  
+  # Resolve PP cluster assignment
+  if(clusters_PP$membership[PP.index, which.max(clusters_PP$membership[PP.index])] > threshold){
+    temp.PP <- clusters_PP$membership[PP.index,]
+    temp.PP <- temp.PP[order(temp.PP, decreasing = T)]
+    cluster_assignment$PP_cluster[i] <- ifelse((temp.PP[[1]] - temp.PP[[2]]) > 0.3, names(temp.PP)[1], "Low Confidence")
+    cluster_assignment$PP_membership[i] <- ifelse((temp.PP[[1]] - temp.PP[[2]]) > 0.3, temp.PP[[1]], "Low Confidence")
+  } else {
+    cluster_assignment$PP_cluster[i] <- "Low Confidence"
+  }
+  
+  # Resolve LL cluster assignment
+  if(clusters_LL$membership[LL.index, which.max(clusters_LL$membership[LL.index,])] > threshold){
+    temp.LL <- clusters_LL$membership[LL.index,]
+    temp.LL <- temp.LL[order(temp.LL, decreasing = T)]
+    cluster_assignment$LL_cluster[i] <- ifelse((temp.LL[[1]] - temp.LL[[2]]) > 0.3, names(temp.LL[1]), "Low Confidence")
+    cluster_assignment$LL_membership[i] <- ifelse((temp.LL[[1]] - temp.LL[[2]]) > 0.3, temp.LL[[1]], "Low Confidence")
+    
+  } else {
+    cluster_assignment$LL_cluster[i] <- "Low Confidence"
+  }
+  
+  cluster_assignment$annotation[i] <- annotations.df$gene[grepl(pattern = paste0("^",GeneID,"$"), x = annotations.df$ID)]
+  rm(temp.LL, temp.PP)
+}
+# Filter
+cluster_assignment$PP_cluster[cluster_assignment$PP_cluster == "Low Confidence"] <- NA
+cluster_assignment$LL_cluster[cluster_assignment$LL_cluster == "Low Confidence"] <- NA
+nrow(cluster_assignment[!is.na(cluster_assignment$PP_cluster) & !is.na(cluster_assignment$LL_cluster),])
+
+cluster_assignment$Switch <- cluster_assignment$PP_cluster != cluster_assignment$LL_cluster
+
+cluster_assignment$Switch[is.na(cluster_assignment$Switch)] <- FALSE
+#cluster_assignment.fs <- cluster_assignment[cluster_assignment$Switch, ]
+
+nrow(cluster_assignment[cluster_assignment$Switch,])
+
+# Genes with cluster switches between x and y.
+cluster_assignment$jump[cluster_assignment$Switch] <- paste0(cluster_assignment$PP_cluster[cluster_assignment$Switch], ":", cluster_assignment$LL_cluster[cluster_assignment$Switch])
+#jumps <- data.frame("jump" = unique(cluster_assignment.fs$jump),
+#                    "count" = NA)
+#jumps <- jumps[order(jumps$jump),]
+#for (i in 1:nrow(jumps)) {
+#  jumps$count[i] <- count(cluster_assignment.fs$jump == jumps$jump[i])
+#  split <- unlist(strsplit(jumps$jump[i], split = ":"))
+#}
+
+for( i in 1:nrow(cluster_assignment)){
+  GeneID <- cluster_assignment$GeneID[i]
+  if(!Master_Res.df$SpecificExpression[grepl(pattern = GeneID, Master_Res.df$GeneID)]){
+    Master_Res.df$Heterochronic[grepl(pattern = GeneID, Master_Res.df$GeneID)] <- cluster_assignment$Switch[i]
+    Master_Res.df$Jump[grepl(pattern = GeneID, Master_Res.df$GeneID)] <- cluster_assignment$jump[i]
+    Master_Res.df$clusterPP[grepl(pattern = GeneID, Master_Res.df$GeneID)] <- cluster_assignment$PP_cluster[i]
+    Master_Res.df$clusterLL[grepl(pattern = GeneID, Master_Res.df$GeneID)] <- cluster_assignment$LL_cluster[i]
+  } else {
+    Master_Res.df$Heterochronic[grepl(pattern = GeneID, Master_Res.df$GeneID)] <- FALSE
+  }
+}
+Master_Res.df$Heterochronic[is.na(Master_Res.df$Heterochronic)] <- FALSE
+count(Master_Res.df$Heterochronic)
+count(Master_Res.df$Heterochronic) / DENOMINATOR.DEG
+
+
+write.table(jumps, file = "Project_Outputs/Count_jumps.txt", quote = F, sep = "\t", row.names = F)
+
+# Heterochrony Examples
+het.genes <- Master_Res.df[Master_Res.df$Heterochronic & Master_Res.df$Jump == "5:7", c("GeneID", "Heterochronic", "Correlation")]
+het.genes <- het.genes[!is.na(het.genes$GeneID),]
+het.genes <- het.genes[order(het.genes$Correlation, decreasing = F), ]
+
+nrow(het.genes)
+
+i=1
+i=i-8
+
+{i = i+1
+ridgeplot.geneTC(gene_ID = het.genes$GeneID[i])}
+
+
+
+
+```
+
+
+
+```{r Spearman correlation}
+# Spearman's correlation for genes in PP and LL
+?stats::cor()
+
+eData_mean_PP.f <- eData_mean_PP[matrixStats::rowSds(as.matrix(eData_mean_PP)) > 1, ]
+eData_mean_LL.f <- eData_mean_LL[matrixStats::rowSds(as.matrix(eData_mean_LL)) > 1, ]
+rownames(eData_mean_PP.f) <- paste0(rownames(eData_mean_PP.f) , "G")
+rownames(eData_mean_LL.f) <- paste0(rownames(eData_mean_LL.f) , "G")
+keep <- intersect(rownames(eData_mean_PP.f), rownames(eData_mean_LL.f))
+
+eData_mean_PP.fi <- eData_mean_PP.f[rownames(eData_mean_PP.f) %in% keep, ]
+eData_mean_LL.fi <- eData_mean_LL.f[rownames(eData_mean_LL.f) %in% keep, ]
+
+corr_res.df <- data.frame("geneID" = rownames(eData_mean_PP.fi), "correlation.coef" = NA, "stat" = NA, "p" = NA)
+for(i in 1:nrow(eData_mean_PP.fi)) {
+  
+  temp <- rbind(eData_mean_PP.fi[i,], eData_mean_LL.fi[i,])
+  rownames(temp) <- c("PP", "LL")
+  temp <- as.data.frame(t(temp))
+  
+  spearman.test <- cor.test(x = temp$PP, y = temp$LL, method = "pearson")
+  corr_res.df$correlation.coef[i] <- spearman.test$estimate
+  corr_res.df$stat[i] <- spearman.test$statistic
+  corr_res.df$p[i] <- spearman.test$p.value
+}
+
+corr_res.df$significant <- corr_res.df$p < 0.05
+
+for( i in 1:nrow(corr_res.df)){
+  GeneID <- sub(corr_res.df$geneID[i], pattern = "G$", replacement = "")
+  if(!Master_Res.df$SpecificExpression[grepl(pattern = GeneID, Master_Res.df$GeneID)]){
+    Master_Res.df$Correlation[grepl(pattern = GeneID, Master_Res.df$GeneID)] <- corr_res.df$correlation.coef[i]
+    Master_Res.df$corr.P[grepl(pattern = GeneID, Master_Res.df$GeneID)] <- corr_res.df$p[i]
+  } else {
+    Master_Res.df$Correlation[grepl(pattern = GeneID, Master_Res.df$GeneID)] <- NA
+    Master_Res.df$corr.P[grepl(pattern = GeneID, Master_Res.df$GeneID)] <- NA
+  }
+}
+
+summary(Master_Res.df$Correlation)
+
+for(i in 1:nrow(Master_Res.df)){
+  if(!is.na(Master_Res.df$Correlation[i])){
+    if(Master_Res.df$Heterochronic[i] & Master_Res.df$Correlation[i] > 0.7){
+    Master_Res.df$Heterochronic[i] <- FALSE
+    }
+  }
+}
+
+ggsave(plot = ggplot(data = Master_Res.df, mapping = aes(x = `Correlation`)) +geom_density(fill = "lightblue"), filename = "Project_Outputs/SpearmanCorrCoeff_Density.png", device = "png", dpi = 500, height = 5, width = 8, units = "in")
+
+
+
+```
+
+
+```{r DE_genes_clusters}
+DEgenes.df <- Master_Res.df[Master_Res.df$everDE & !Master_Res.df$SpecificExpression & !Master_Res.df$Heterochronic, c("GeneID", "clusterPP", "clusterLL")]
+
+ridgeplot.geneTC(gene_ID = DEgenes.df$GeneID[32])
+plot.geneTC(gene_ID = DEgenes.df$GeneID[32])
+ggsave(plot = ridgeplot.geneTC(gene_ID = "Sbene_G00260") + labs(caption = "Sbene_G00260"), filename = "Project_Outputs/DEgene_example_ridge.png", 
+       device = "png", width = 10, height = 6)
+ggsave(plot = plot.geneTC(gene_ID = "Sbene_G00260") + labs(caption = "Sbene_G00260"), filename = "Project_Outputs/DEgene_example_line.png", 
+       device = "png", width = 10, height = 6)
+
+DEgenes.df <- DEgenes.df[!is.na(DEgenes.df$clusterPP),]
+DEgenes.df <- DEgenes.df[DEgenes.df$clusterPP == DEgenes.df$clusterLL,]
+deg_cluster_count <- list()
+deg_cluster_count$cluster <- unique(DEgenes.df$clusterPP)
+for( i in seq_along(deg_cluster_count$cluster)){
+  deg_cluster_count$count[i] <- count(DEgenes.df$clusterPP == deg_cluster_count$cluster[i])
+}
+
+
+deg_cluster.plot <- ggplot(data = as.data.frame(deg_cluster_count), mapping = aes(x = `cluster`, y = `count`, fill = `cluster`)) + geom_bar(stat = "identity")
+ggsave(filename = "Project_Outputs/DEG_cluster_bar.png", plot = deg_cluster.plot, device = "png", height = 8, width = 10, dpi = 1200)
+
+
+```
+
+
+
+Make a heatmap of clusters with genes in clusters for PP and LL to demonstrate overlap and cluster switches
+```{r Cluster heatmap}
+
+corr.data <- cluster_assignment.f[,c("PP_cluster", "LL_cluster")]
+rownames(corr.data) <- cluster_assignment.f$GeneID
+corr.data$PP_cluster <- paste0("cluster", corr.data$PP_cluster)
+corr.data$LL_cluster <- paste0("cluster", corr.data$LL_cluster)
+corr.data$switch <- paste0(corr.data$PP_cluster, ":", corr.data$LL_cluster)
+corr.data <- as.data.frame(corr.data[,3], row.names = cluster_assignment.f$GeneID)
+colnames(corr.data) <- "switch"
+
+clusternames <- c(paste0("cluster", 1:8))
+clusternames <- clusternames[c(6,7,8,4,1,3,5,2)]
+
+corr.mat <- matrix(data = NA, nrow = length(clusternames), ncol = length(clusternames))
+colnames(corr.mat) <- clusternames
+rownames(corr.mat) <- clusternames
+
+for(i in 1:ncol(corr.mat)){
+  col.clust <- clusternames[i]
+  for(j in 1:nrow(corr.mat)){
+    row.clust <- clusternames[j]
+    
+    corr.mat[j,i] <- sum(corr.data$switch == paste(row.clust, col.clust, sep = ":"))
+  }
+}
+
+log.corr.mat <- log(corr.mat, base = 2)
+log.corr.mat[is.infinite(log.corr.mat)] <- 0
+
+corr.gg <- reshape2::melt(log.corr.mat)
+
+corr.mat.plot <- ggplot(data = corr.gg, aes(x=Var1, y=Var2, fill=value)) +
+                  geom_tile() +
+                  labs(x = "Planktotroph", y = "Lecithotroph", caption = "value = log2(number of genes in this switch)")
+
+ggsave(plot = corr.mat.plot, filename = "Project_Outputs/Cluster_correlation_heatmap.png", device = "png", width = 11, height = 10, units = "in", dpi = 1200)
+
+
+```
+
+
+
+Mfuzz cluster PCA and Jump Scoring
+```{r Euclidean_distance}
+
+profiles_PP <- as.data.frame(eset_PP.fs)
+profiles_PP <- profiles_PP[, 1:(ncol(profiles_PP)-3)]
+profiles_PP <- mutate_all(profiles_PP, as.numeric)
+colnames(profiles_PP) <- paste0("PP_", colnames(profiles_PP))
+profiles_LL <- as.data.frame(eset_LL.fs)
+profiles_LL <- profiles_LL[, 1:(ncol(profiles_LL)-3)]
+profiles_LL <- mutate_all(profiles_LL, as.numeric)
+colnames(profiles_LL) <- paste0("LL_", colnames(profiles_LL))
+
+profiles_all <- do.call("cbind", list(profiles_PP, profiles_LL))
+
+prcomp_all <- prcomp(profiles_all, retx = T)
+prcomp_all$Variance <- (prcomp_all$sdev^2)/(sum(prcomp_all$sdev^2))
+
+
+
+
+acore_clusters <- Mfuzz::acore(eset = eset_PP.fs, cl = clusters_PP, min.acore = 0.85)
+names(acore_clusters) <- c("c1","c2","c3","c4","c5", "c6", "c7", "c8") #, "c9", "c10", "c11", "c12")
+
+c1 <- acore_clusters$c1$NAME[which.max(acore_clusters$c1$MEM.SHIP)]
+c2 <- acore_clusters$c2$NAME[which.max(acore_clusters$c2$MEM.SHIP)]
+c3 <- acore_clusters$c3$NAME[which.max(acore_clusters$c3$MEM.SHIP)]
+c4 <- acore_clusters$c4$NAME[which.max(acore_clusters$c4$MEM.SHIP)]
+c5 <- acore_clusters$c5$NAME[which.max(acore_clusters$c5$MEM.SHIP)]
+c6 <- acore_clusters$c6$NAME[which.max(acore_clusters$c6$MEM.SHIP)]
+c7 <- acore_clusters$c7$NAME[which.max(acore_clusters$c7$MEM.SHIP)]
+c8 <- acore_clusters$c8$NAME[which.max(acore_clusters$c8$MEM.SHIP)]
+c9 <- acore_clusters$c9$NAME[which.max(acore_clusters$c9$MEM.SHIP)]
+c10 <- acore_clusters$c10$NAME[which.max(acore_clusters$c10$MEM.SHIP)]
+c11 <- acore_clusters$c11$NAME[which.max(acore_clusters$c11$MEM.SHIP)]
+c12 <- acore_clusters$c12$NAME[which.max(acore_clusters$c12$MEM.SHIP)]
+
+cores <- c(c1, c2, c3, c4, c5, c6, c7, c8) #, c9, c10, c11, c12)
+cores <- paste0("PP_", cores)
+names(cores) <- c("c1","c2","c3","c4","c5", "c6", "c7", "c8") #, "c9", "c10", "c11", "c12")
+
+d <- data.frame("PC1" = prcomp_all$rotation[,1], 
+                "PC2" = prcomp_all$rotation[,2], 
+                "name" = rownames(prcomp_all$rotation))
+d$center <- d$name %in% cores
+for (i in 1:nrow(d)){
+  d$labels[i] <- ifelse(d$name[i] %in% cores, names(cores)[grepl(pattern = d$name[i], x = names(cores))], NA)
+}
+
+attr(d, "percentVar") <- prcomp_all$Variance
+View(d)
+
+profles_pca <- ggplot(data = d, mapping = aes(x = `PC1`, y = `PC2`, label = `labels`)) + 
+  geom_point(size = 0.5, color = "grey", alpha = 0.75) +
+  geom_point(data = d[d$center,], size=1, color="black") +
+  xlab(paste0("PC1: ", round(attr(d, "percentVar")[1] * 100), "% variance")) +
+  ylab(paste0("PC2: ", round(attr(d, "percentVar")[2] * 100), "% variance")) +
+  scale_x_continuous(limits = c(-0.015, 0.015)) +
+  scale_y_continuous(limits = c(-0.015, 0.015))
+
+ggsave(filename = "Project_Outputs/Profile_PCA.jpg", plot = profles_pca, device = "jpg", dpi = 1000,
+      height = 10, width = 14, units="in")
+
+jumpscores.df <- data.frame("geneID" = common_gene_list, "jumpscore" = NA)
+
+for( i in 1:nrow(jumpscores.df)){
+  geneID <- jumpscores.df$geneID[i]
+  jumpscores.df$jumpscore[i] <- sqrt( prcomp_all$Variance[1] * (d$PC1[grepl(x = d$name, pattern = paste0("PP_", geneID))] - d$PC1[grepl(x = d$name, pattern = paste0("LL_", geneID))])^2 + 
+                                        prcomp_all$Variance[2] * (d$PC2[grepl(x = d$name, pattern = paste0("PP_", geneID))] - d$PC2[grepl(x = d$name, pattern = paste0("LL_", geneID))])^2 )
+}
+
+write.table(jumpscores.df, file = "Project_Data/jumpscores_df.txt",quote = F, sep = "\t", row.names = F)
+jumpscores.df <- read.table(file = "Project_Data/jumpscores_df.txt", header = T)
+
+for( i in 1:nrow(jumpscores.df)){
+  GeneID <- jumpscores.df$geneID[i]
+  if(!Master_Res.df$SpecificExpression[grepl(pattern = GeneID, Master_Res.df$GeneID)]){
+    Master_Res.df$JumpScore[grepl(pattern = GeneID, Master_Res.df$GeneID)] <- jumpscores.df$jumpscore[i]
+  }
+}
+
+count(Master_Res.df$Heterochronic) / DENOMINATOR.DEG
+DENOMINATOR.EXPR
+
+nrow(d)/2
+nrow(jumpscores.df)
+
+
+
+```
+
+```{r Euclidean_distance Density Plot}
+
+jump.density.df <- data.frame("score" = Master_Res.df$JumpScore[!is.na(Master_Res.df$JumpScore)],
+                              "type" = Master_Res.df$Heterochronic[!is.na(Master_Res.df$JumpScore)])
+jump.density.df$type[jump.density.df$type] <- "Heterochrony"
+jump.density.df$type[jump.density.df$type == FALSE] <- "Not Heterochrony"
+
+jump.density.plot <- ggplot(data = jump.density.df, mapping = aes(x = `score`, fill = `type`)) + geom_density()
+ggsave(filename = "Project_Outputs/Jumpscore_density_plot.png", plot = jump.density.plot, device = "png", units = "in", width = 10, height = 8, dpi = 1200)
+
+```
+
+
+
+```{r F1 MisExpression}
+
+# Combine the F1 samples into a single group -- exclude parental effects from these results (effects are limited and safe to exclude)
+data.meta.moi <- data.meta.trim
+data.meta.moi$Genotype <- factor(data.meta.moi$Genotype, levels = c("PP", "F1", "LL"))
+data.meta.moi$Genotype[is.na(data.meta.moi$Genotype)] <- "F1"
+data.meta.moi$multiFactor <- factor(paste(data.meta.moi$Genotype, data.meta.moi$TissueType, sep = "_"))
+
+DataSet.moi <- DESeqDataSetFromMatrix(countData = Count.Matrix.filter, 
+                                  colData = data.meta.moi, 
+                                  design = ~ multiFactor)
+dds.moi <- DESeq(DataSet.moi)
+
+# List to hold all results
+Inheritance.summary_all.ls <- list()
+Inheritance.counts_all.ls <- list()
+
+for( i in seq_along(time_points)) {
+
+  # Inheritance Mode Tests (Both F1's)
+  res.PP.LL <- res[[i]]
+  res.F1.PP <- results(dds.moi, contrast = c("multiFactor", paste0("F1_", names(time_points)[i]), paste0("PP_", names(time_points)[i])), alpha = alpha_p)
+  res.F1.LL <- results(dds.moi, contrast = c("multiFactor", paste0("F1_", names(time_points)[i]), paste0("LL_", names(time_points)[i])), alpha = alpha_p)
+  
+  # Assign Mode of Inheritance based on F1
+  Inheritance.summary.df <- data.frame("dds.Inheritance.PPvsLL.padj" = as.data.frame(res.PP.LL)$padj,
+                                "dds.Inheritance.PPvsLL.l2fc" = as.data.frame(res.PP.LL)$log2FoldChange,
+                                "dds.Inheritance.F1vsLL.padj" = as.data.frame(res.F1.LL)$padj,
+                                "dds.Inheritance.F1vsLL.l2fc" = as.data.frame(res.F1.LL)$log2FoldChange,
+                                "dds.Inheritance.F1vsPP.padj" = as.data.frame(res.F1.PP)$padj,
+                                "dds.Inheritance.F1vsPP.l2fc" = as.data.frame(res.F1.PP)$log2FoldChange,
+                                row.names = rownames(as.data.frame(res.PP.LL)))
+  
+  
+  
+  # Remove genes DE between F1's -- these have parental/reciprocal effects going on
+  PoO_genes <- unique(c(res.DEG$sixteencell_PLvLP$GeneID, res.DEG$gastrula_PLvLP$GeneID, res.DEG$swimming_PLvLP$GeneID))
+  Inheritance.summary.df <- Inheritance.summary.df[!rownames(Inheritance.summary.df) %in% PoO_genes,]
+  
+  # Use nested ifelse to assign codes to expression patterns
+  #       Credit to Lingyu Wang (Greg Wray's Lab) for this implementation
+  Inheritance.summary.df$dds.Inheritance.Code.PPvsLL <- ifelse(is.na(Inheritance.summary.df$dds.Inheritance.PPvsLL.padj), 400,
+                                              ifelse(Inheritance.summary.df$dds.Inheritance.PPvsLL.padj >= alpha_p, 0,
+                                                     ifelse(Inheritance.summary.df$dds.Inheritance.PPvsLL.padj < alpha_p & Inheritance.summary.df$dds.Inheritance.PPvsLL.l2fc < 0, 100,
+                                                            ifelse(Inheritance.summary.df$dds.Inheritance.PPvsLL.padj < alpha_p & Inheritance.summary.df$dds.Inheritance.PPvsLL.l2fc > 0, 200, 500))))
+  
+  Inheritance.summary.df$dds.Inheritance.Code.F1vsLL <- ifelse(is.na(Inheritance.summary.df$dds.Inheritance.F1vsLL.padj), 400,
+                                                 ifelse(Inheritance.summary.df$dds.Inheritance.F1vsLL.padj >= alpha_p, 0,
+                                                        ifelse(Inheritance.summary.df$dds.Inheritance.F1vsLL.padj < alpha_p & Inheritance.summary.df$dds.Inheritance.F1vsLL.l2fc < 0, 10,
+                                                               ifelse(Inheritance.summary.df$dds.Inheritance.F1vsLL.padj < alpha_p & Inheritance.summary.df$dds.Inheritance.F1vsLL.l2fc > 0, 20, 500))))
+  
+  Inheritance.summary.df$dds.Inheritance.Code.F1vsPP <- ifelse(is.na(Inheritance.summary.df$dds.Inheritance.F1vsPP.padj), 400,
+                                                 ifelse(Inheritance.summary.df$dds.Inheritance.F1vsPP.padj >= alpha_p, 0,
+                                                        ifelse(Inheritance.summary.df$dds.Inheritance.F1vsPP.padj < alpha_p & Inheritance.summary.df$dds.Inheritance.F1vsPP.l2fc < 0, 1,
+                                                               ifelse(Inheritance.summary.df$dds.Inheritance.F1vsPP.padj < alpha_p & Inheritance.summary.df$dds.Inheritance.F1vsPP.l2fc > 0, 2, 500))))
+  
+  Inheritance.summary.df$dds.Inheritance.Codes <- rowSums(Inheritance.summary.df[, c("dds.Inheritance.Code.PPvsLL", "dds.Inheritance.Code.F1vsLL", "dds.Inheritance.Code.F1vsPP")])
+  
+  Inheritance.summary.df$dds.Inheritance.MOI <- ifelse(Inheritance.summary.df$dds.Inheritance.Codes %in% code.Ambiguous, "Ambiguous", 
+                                            ifelse(Inheritance.summary.df$dds.Inheritance.Codes %in% code.Additive, "Additive", 
+                                                   ifelse(Inheritance.summary.df$dds.Inheritance.Codes %in% code.Conserved, "Conserved", 
+                                                          ifelse(Inheritance.summary.df$dds.Inheritance.Codes %in% code.LDominant, "LL Dominant", 
+                                                                 ifelse(Inheritance.summary.df$dds.Inheritance.Codes %in% code.PDominant, "PP Dominant", 
+                                                                        ifelse(Inheritance.summary.df$dds.Inheritance.Codes %in% code.OverDominant, "Overdominant", 
+                                                                               ifelse(Inheritance.summary.df$dds.Inheritance.Codes %in% code.UnderDominant,
+                                                                                      "Underdominant","Uninformative")))))))
+  
+  # Summaries of Inheritance Mode Results
+  Inheritance.counts <- data.frame("Mode" = c("Underdominant", "Overdominant", "Conserved", "Additive", "PP Dominant", "LL Dominant", "Uninformative", "Ambiguous"),
+                                      "count" = c(sum(stri_count(Inheritance.summary.df$dds.Inheritance.MOI, regex = "Underdominant")),
+                                                  sum(stri_count(Inheritance.summary.df$dds.Inheritance.MOI, regex = "Overdominant")),
+                                                  sum(stri_count(Inheritance.summary.df$dds.Inheritance.MOI, regex = "Conserved")),
+                                                  sum(stri_count(Inheritance.summary.df$dds.Inheritance.MOI, regex = "Additive")),
+                                                  sum(stri_count(Inheritance.summary.df$dds.Inheritance.MOI, regex = "PP Dominant")),
+                                                  sum(stri_count(Inheritance.summary.df$dds.Inheritance.MOI, regex = "LL Dominant")),
+                                                  sum(stri_count(Inheritance.summary.df$dds.Inheritance.MOI, regex = "Uninformative")),
+                                                  sum(stri_count(Inheritance.summary.df$dds.Inheritance.MOI, regex = "Ambiguous"))))
+  Inheritance.counts$Mode <- factor(Inheritance.counts$Mode, levels = c("Additive", "Underdominant", "Overdominant", "PP Dominant", "LL Dominant", "Uninformative", "Ambiguous", "Conserved"))
+  
+  Inheritance.summary_all.ls[[i]] <- Inheritance.summary.df
+  Inheritance.counts_all.ls[[i]] <- Inheritance.counts
+  
+}
+
+names(Inheritance.summary_all.ls) <- names(time_points)
+names(Inheritance.counts_all.ls) <- names(time_points)
+
+
+for(i in seq_along(Inheritance.counts_all.ls)){
+  Inheritance.counts_all.ls[[i]]$Stage <- names(time_points)[i]
+}
+
+Inheritance.counts_all.ldf <- do.call("rbind", Inheritance.counts_all.ls)
+rownames(Inheritance.counts_all.ldf) <- NULL
+Inheritance.counts_all.ldf$Mode <- factor(Inheritance.counts_all.ldf$Mode, levels = c("Additive", "Underdominant", "Overdominant", "PP Dominant", "LL Dominant", "Uninformative", "Ambiguous", "Conserved"))
+Inheritance.counts_all.ldf$Stage <- factor(Inheritance.counts_all.ldf$Stage, levels = names(time_points))
+
+Moi_barplot_all <- ggplot(data = Inheritance.counts_all.ldf, mapping = aes(x = `Stage`, y = `count`, fill = `Mode`)) + geom_bar(position = "stack", stat = "identity")
+Moi_barplot_mis <- ggplot(data = Inheritance.counts_all.ldf[Inheritance.counts_all.ldf$Mode %in% c("Underdominant", 
+                                                                                                   "Overdominant",
+                                                                                                   "PP Dominant", 
+                                                                                                   "LL Dominant"), ], 
+                          mapping = aes(x = `Stage`, y = `count`, fill = `Mode`)) + geom_bar(position = "stack", stat = "identity")
+
+ggsave(filename = "Project_Outputs/tcMoi_barplot_all.png", plot = Moi_barplot_all, device = "png", units = "in", width = 10, height = 8, dpi = 1200)
+ggsave(filename = "Project_Outputs/tcMoi_barplot_domandmis.png", plot = Moi_barplot_mis, device = "png", units = "in", width = 10, height = 8, dpi = 1200)
+
+```
+
+
+
+```{r PoO_Effect_Genes}
+
+# Add Parent of origin effects to master results data frame
+PoO_sixteen <- res.DEG$sixteencell_PLvLP$GeneID
+PoO_gast <- res.DEG$gastrula_PLvLP$GeneID
+PoO_swim <- res.DEG$swimming_PLvLP$GeneID
+
+
+PoO_genes <- unique(PoO_gast[!(PoO_gast %in% PoO_sixteen)], PoO_swim[!(PoO_swim %in% PoO_sixteen)])
+
+# I'm not sure if I want to exclude genes that I've previously identified as Morph-Specific. These could still be DE in the F1's due to parental effects I guess.
+for( i in 1:length(PoO_genes)){
+  GeneID <- PoO_genes[i]
+  if(!Master_Res.df$SpecificExpression[grepl(pattern = GeneID, Master_Res.df$GeneID)]){
+    Master_Res.df$PoO[grepl(pattern = GeneID, Master_Res.df$GeneID)] <- TRUE
+  } else {
+    Master_Res.df$PoO[grepl(pattern = GeneID, Master_Res.df$GeneID)] <- TRUE
+  }
+}
+
+Master_Res.df$PoO[is.na(Master_Res.df$PoO)] <- FALSE
+
+View(Master_Res.df)
+
+
+count(Master_Res.df$PoO) / DENOMINATOR.DEG
+
+
+
+
+
+# HEATMAP for overviews
+c.time <- "gastrula"
+PoO_genes <- c(res.DEG$gastrula_PLvLP$GeneID)
+PoO_genes <- c(intersect(res.DEG$swimming_PLvLP$GeneID, res.DEG$swimming_PPvLL$GeneID))
+length(PoO_genes)
+
+
+write.table(res.DEG$swimming_PPvLL[res.DEG$swimming_PPvLL$GeneID %in% PoO_genes, c("GeneID", "annotation")], file = "Project_Outputs/Genotype_x_stage_DEGs/swimming_annotations.csv", sep = ",")
+
+
+
+# Heatmap settings
+anno_cols <- list(Genotype = colors.streb) # list out all possible modes and colors for them
+anno_cols$Genotype <- anno_cols$Genotype[as.character(names(anno_cols$Genotype)) %in% levels(dds$Genotype)] # filter down to only what will be on the heatmap
+paletteLength <- 35
+myColor <- colorRampPalette(c("blue", "beige", "red"))(paletteLength)
+
+# Make a heatmap which has only the genes contained in PoO genes
+col.order <- c(dds$sampleID[dds$Genotype == "PP" & dds$TissueType == c.time], 
+               dds$sampleID[dds$Genotype == "PL" & dds$TissueType == c.time], 
+               dds$sampleID[dds$Genotype == "LP" & dds$TissueType == c.time], 
+               dds$sampleID[dds$Genotype == "LL" & dds$TissueType == c.time])
+#col.order <- c(dds$sampleID[dds$Genotype == "PL" & dds$TissueType == c.time], dds$sampleID[dds$Genotype == "LP" & dds$TissueType == c.time])
+anno.col_order <- as.data.frame(colData(vsd)[vsd$TissueType == c.time, c("sampleID", "Genotype")])[match(col.order, rownames(colData(vsd)[vsd$TissueType == c.time,])),]
+anno.col_order$Genotype <- factor(anno.col_order$Genotype, levels = levels(dds$Genotype))
+anno.col_order <- as.data.frame(anno.col_order$Genotype)
+rownames(anno.col_order) <- rownames(as.data.frame(colData(vsd)[, c("sampleID", "Genotype")])[match(col.order, rownames(colData(vsd))),])
+colnames(anno.col_order) <- c("Genotype")
+overlap.mat <- assay(vsd)[rownames(assay(vsd)) %in% PoO_genes,]
+overlap.mat <- assay(vsd)
+order_cols.mat <- overlap.mat[,match(col.order, colnames(overlap.mat))]
+mat <- order_cols.mat - rowMeans(order_cols.mat)
+mat <- mat[rowAlls(mat != 0),]
+myBreaks <- c(seq(min(mat), 0.4, length.out=ceiling(paletteLength/2) + 1),
+              seq(max(mat)/paletteLength, max(mat), length.out=floor(paletteLength/2)))
+h.PoO <- pheatmap(mat, annotation_col = anno.col_order, color = myColor, breaks = myBreaks, annotation_colors = anno_cols, 
+                      show_rownames = F, show_colnames = F, 
+                      clustering_method = "ward.D2", scale = "row", 
+                      cluster_cols = F)
+ggsave(filename = "Project_Outputs/Genotype_x_stage_DEGs/Heatmap_PoOgenes_swimming.jpg",
+       plot = h.PoO, 
+       device = "jpg", width = 8, height = 9, 
+       units = "in", dpi = 1000)
+```
+
+
+
+
+Print some summary numbers of the results of the differential expression analysis
+```{r}
+print(paste0("Number of differentially expressed genes: ", nrow(res.DEG[[1]])))
+```
+
+
+Make a basic volcano plot of the results. Volcano plots help us see the distribution of differences in gene expression between two groups.
+```{r}
+
+
+# Set up a data frame for plotting  (mostly this is the same information as contained in res.filtered)
+data.volcano <- data.frame("l2fc" = res.filtered[[1]]$log2FoldChange, 
+                           "nlog.padj" = -log10(res.filtered[[1]]$padj),
+                           "significant" = ifelse(res.filtered[[1]], "Significant", "Not significant"),
+                           "direction" = ifelse(res.filtered[[1]]$log2foldChange < 0, # CHECK THIS once the metadata/contrasts are worked out
+                                                ifelse(res.filtered[[1]]$significant,
+                                                       "Soft", "NS"),
+                                                ifelse(res.filtered[[1]]$significant,
+                                                       "Firm", "NS")),
+                           row.names = res.filtered[[1]]$GeneID)
+
+
+# Create a volcano plot from the data above using the ggplot2 package
+colors.vp <- colors.bb[(names(colors.bb) %in% data.volcano$direction)]
+colors.vp[(length(colors.vp) +1)] <- "gray35"; names(colors.vp)[length(colors.vp)] <- "NS"
+
+labels.vp <- c("Higher in Soft", "Higher in Firm", "Higher in First", "Higher in Second"); names(labels.vp) <- names(colors.bb)
+labels.vp <- labels.vp[(names(labels.vp) %in% data.volcano$direction)]
+labels.vp[(length(labels.vp) +1)] <- "Not significant"; names(labels.vp)[length(labels.vp)] <- "NS"
+
+# Create a volcano plot from the data above using the ggplot2 package
+vp.plot <- ggplot(data = data.volcano, aes(x = `l2fc`, y = `nlog.padj`, col = `direction`)) +
+    geom_point(data = data.volcano, size = 1) +
+    scale_x_continuous(limits = c(min(data.volcano$l2fc) - 1, max(data.volcano$l2fc) +1)) +
+    scale_y_continuous(limits = c(-0.05, max(data.volcano$nlog.padj) +1)) +
+    labs(x = "log2 Fold Change", y = "-log10 FDR corrected p-value") +
+    scale_color_manual(labels = labels.vp , values = colors.vp) +
+    theme(legend.title = element_blank(), legend.text = element_text(size=16),
+          axis.title=element_text(size=20), axis.text = element_text(size=10)) + 
+    guides(color = guide_legend(override.aes = list(size=5), reverse = T))
+
+# Save the volcano plot in a JPG file
+ggsave(filename = "VolcanoPlot_Blueberries.jpg", 
+       plot = vp.plot, 
+       device = "jpg", dpi = 1000, 
+       height = 6, width = 8, units = "in")
+
+# Environment clean-up:
+rm(vp.plot, colors.vp, labels.vp)
+
+
+```
+
+
+Make a heatmap of the selected DEGs. Heatmaps are useful for understanding how the samples within your groups of interest compare to each other.
+```{r}
+
+# Heatmap settings
+anno_cols <- list(Phenotype = colors.bb)
+anno_cols$Phenotype <- anno_cols$Phenotype[as.character(names(anno_cols$Mode)) %in% levels(dds$phenotype)]
+paletteLength <- 35
+myColor <- colorRampPalette(c("blue", "beige", "red"))(paletteLength)
+anno <- as.data.frame(colData(vsd)[, 2:4])
+anno$phenotype <- factor(anno$phenotype, levels = levels(dds$phenotype))
+anno2 <- as.data.frame(anno$phenotype)
+rownames(anno2) <- rownames(anno)
+colnames(anno2) <- c("Phenotype")
+
+# Build a data frame to generate a heatmap from
+deg.mat <- assay(vsd)[rownames(assay(vsd)) %in% res.DEG[[1]]$GeneID, ]
+mat <- deg.mat - rowMeans(deg.mat)
+myBreaks <- c(seq(min(mat), 0.4, length.out=ceiling(paletteLength/2) + 1),
+                  seq(max(mat)/paletteLength, max(mat), length.out=floor(paletteLength/2)))
+
+# Create a heatmap using the package `pheatmap`
+h.deg <- pheatmap(mat, annotation_col = anno2, color = myColor, breaks = myBreaks, annotation_colors = anno_cols, 
+                  show_rownames = F, show_colnames = F, 
+                  scale = "row", clustering_method = "ward.D2",
+                  cluster_rows = T, cluster_cols = T,
+                  fontsize = 20, cellwidth = 18)
+
+ggsave("Heatmap_DEG_Blueberry.jpg", 
+       plot = h.deg, 
+       device = "jpg", dpi = 500, 
+       width = 12, height = 10, units = "in")
+
+# Environment clean-up:
+rm(vp.plot, colors.vp, labels.vp)
+
+```
+
+
+
+```{r}
+
+###
+### Extra code for if you want to order heatmap columns by groups
+###
+
+col.order <- c(dds$ID[dds$mode == "P"], dds$ID[dds$mode == "L"], dds$ID[dds$mode == "F1_P"], dds$ID[dds$mode == "F1_L"])
+anno.col_order <- as.data.frame(colData(vsd.HM.All)[, 2:4])[match(col.order, rownames(colData(vsd.HM.All))),]
+anno.col_order$mode <- factor(anno.col_order$mode, levels = levels(dds$mode))
+anno.col_order <- as.data.frame(anno.col_order$mode)
+rownames(anno.col_order) <- rownames(as.data.frame(colData(vsd.HM.All)[, 2:4])[match(col.order, rownames(colData(vsd.HM.All))),])
+colnames(anno.col_order) <- c("Mode")
+deg.mat <- assay(vsd.HM.All)[rownames(assay(vsd.HM.All)) %in% sig.DEG[["contrastP0"]]$row,]
+order_cols.mat <- deg.mat[,match(col.order, colnames(deg.mat))]
+mat <- order_cols.mat - rowMeans(order_cols.mat)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+HyLiTE Allele-Specific Expression Analyses
+```{r HyLiTE, message=FALSE, warning=FALSE, include=FALSE}
+
+# Read in the HyLiTE protocol key
+key <- read.table(file = "Project_Data/HyLiTE_inputs/timecourse_HyLiTE_protocol_key.txt", header = F, sep = "\t", col.names = c("Generation", "identifier", "sampleID"))
+
+# Read in allele-specific expression data generated by HyLiTE
+HL_raw <- list()
+HL_allele <- list.files(pattern = "*.read.summary.txt", path = "Project_Data/HyLiTE_inputs", full.names = T)
+HL_raw <- lapply(HL_allele, read.table, header = T)
+names(HL_raw) <- stringr::str_replace(stringr::str_replace(basename(HL_allele), pattern = "bt2_timecourse.C", replacement = "C"), pattern = ".read.summary.txt", replacement = ".raw")
+
+HL_allele_data <- list()
+for(k in 1:length(HL_raw)) {
+  HL_allele_data[[k]] <- as.data.frame(matrix(NA, nrow = NROW(HL_raw[[1]]), ncol = 2, 
+                                                dimnames = list(c(HL_raw[[1]][1:NROW(HL_raw[[1]]),1]), 
+                                                                c("P1", "P2"))))
+}
+names(HL_allele_data) <- stringr::str_replace(stringr::str_replace(basename(HL_allele), pattern = "bt2_timecourse.C", replacement = "C"), pattern = ".read.summary.txt", replacement = ".data")
+for (j in 1:length(HL_allele_data)) {
+  HL_allele_data[[j]][,1] <- as.numeric(HL_raw[[j]][,2] + HL_raw[[j]][,3])
+  HL_allele_data[[j]][,2] <- as.numeric(HL_raw[[j]][,4] + HL_raw[[j]][,5])
+}
+
+
+# Adjust names of HL_allele_data to match sample ID's <-- pattern match to data.meta.trim$fileName and use the sampleID column
+for(i in 1:length(HL_allele_data)) {
+  keyword <- key$sampleID[grepl(pattern = paste0("^", names(HL_allele_data)[i], "$"), paste0(key$Generation, ".", key$identifier, ".data"))]
+  sampleID <- data.meta$sampleID[grepl(pattern = paste0("^", keyword, "$"), sub(data.meta$fileName, pattern = "_quant.sf", replacement = ""))]
+  names(HL_allele_data)[i] <- sampleID
+}
+
+###
+### Read in expression data from HyLiTE (possibility to use salmon expression quantification data for higher accuracy, but prefer to use data from HyLiTE since it used the same parameters for the allele expression)
+###
+
+expr.df <- read.table(file = "Project_Data/HyLiTE_inputs/bt2_timecourse.expression.txt", header = T, sep = "\t")
+expr.df <- data.frame(expr.df[,-1], row.names=expr.df[,1])
+
+# Adjust colnames of expr.df to match sample ID's <-- pattern match to data.meta.trim$fileName and use the sampleID column
+for(i in 1:ncol(expr.df)) {
+  keyword <- key$sampleID[grepl(pattern = paste0("^", colnames(expr.df)[i], "$"), paste0(key$Generation, ".", key$identifier), perl = T)]
+  sampleID <- data.meta$sampleID[grepl(pattern = paste0("^", keyword, "$"), sub(data.meta$fileName, pattern = "_quant.sf", replacement = ""))]
+  colnames(expr.df)[i] <- sampleID
+}
+
+# Swap the column names of the samples whose adapters were mixed up
+colnames(expr.df)[colnames(expr.df) == "BayPP_swimming_1_tc1"] <- "temp"
+colnames(expr.df)[colnames(expr.df) == "BayYY_gastrula_1_tc1"] <- "BayPP_swimming_1_tc1"
+colnames(expr.df)[colnames(expr.df) == "temp"] <- "BayYY_gastrula_1_tc1"
+
+# Environment clean-up:
+rm(keyword, sampleID, i, HL_raw)
+
+```
+
+
+
+```{r AlleleAssignment_filter}
+
+
+#ToDo: separate by time-point, so we can summarize each time point, but leave a list-entry for a summary of all the data together
+F1_groups <- list("All" = c(names(HL_allele_data)), "16cell" = c(names(HL_allele_data)[names(HL_allele_data) %in% data.meta.trim$sampleID[data.meta.trim$TissueType == "16cell"]]),"blastula" = c(names(HL_allele_data)[names(HL_allele_data) %in% data.meta.trim$sampleID[data.meta.trim$TissueType == "blastula"]]),"gastrula" = c(names(HL_allele_data)[names(HL_allele_data) %in% data.meta.trim$sampleID[data.meta.trim$TissueType == "gastrula"]]),"prototroch" = c(names(HL_allele_data)[names(HL_allele_data) %in% data.meta.trim$sampleID[data.meta.trim$TissueType == "prototroch"]]),"swimming" = c(names(HL_allele_data)[names(HL_allele_data) %in% data.meta.trim$sampleID[data.meta.trim$TissueType == "swimming"]]),"1week" = c(names(HL_allele_data)[names(HL_allele_data) %in% data.meta.trim$sampleID[data.meta.trim$TissueType == "1week"]]))
+  
+
+stats_list <- list()
+for (i in 1:7) {
+  stats_list[[i]] <- as.data.frame(matrix(NA, nrow = NROW(HL_allele_data[[1]]), ncol = 3, 
+                                           dimnames = list(c(rownames(HL_allele_data[[1]])), 
+                                                           c("Proportion", "Mean", "Log2(Mean)"))))
+}
+names(stats_list) <- c("All", "16cell", "blastula", "gastrula", "prototroch", "swimming", "1week")
+
+for (i in 1:7) {
+  stats_list[[i]]$Proportion <- (rowSums(do.call("cbind", HL_allele_data[unlist(F1_groups[i])])) / length(HL_allele_data[unlist(F1_groups[i])])) / 
+  (rowSums(expr.df[, unlist(F1_groups[i])]) / length(HL_allele_data[unlist(F1_groups[i])]))
+}
+
+# Add allele assignment rates (per gene) to master data
+for(i in 1:nrow(stats_list$All)){
+  GeneID <- rownames(stats_list$All)[i]
+  Master_Res.df$AlleleAssignment[grepl(pattern = GeneID, Master_Res.df$GeneID)] <- stats_list$All$Proportion[i]
+}
+Master_Res.df$AlleleAssignment[is.na(Master_Res.df$AlleleAssignment)] <- NaN
+
+print(paste0("Overall mean allele assignment rate: ", 100*mean(na.omit(stats_list$All$Proportion)), "%"))
+# ^^ Can also be broken down by time-point
+
+
+# NOT YET ADAPTED to time course data
+# Filtering genes to be analyzed by their reads' mean allele assignment rate across samples
+Proportion.df <- data.frame("Proportion" = stats_list$Proportion)
+rownames(Proportion.df) <- rownames(stats_list)
+Proportion.df <- filter(Proportion.df, Proportion.df$Proportion > 0.2 & rowSums(do.call("cbind", HL_allele_data)) > 10 )
+
+p.dAssignment <- ggplot(Proportion.df) + 
+  stat_density(aes(Proportion), position = "identity", geom = "line", show.legend = T, adjust = 0.5, size = 1, color = "purple3") +
+  theme_classic() + 
+  theme(plot.title = element_text(size=18, vjust = 1.5, face = "bold"), 
+        axis.text = element_text(size=16), axis.title=element_text(size=18), 
+        legend.text = element_text(size=16), legend.title=element_text(size=16))  + 
+  theme(panel.grid.minor = element_blank(), panel.grid.major = element_blank(), plot.background = element_rect(fill = "transparent", colour = NA)) + 
+  theme(strip.text.x = element_text(size=15, face="italic")) +  
+  theme(strip.background = element_rect(colour="black", fill="transparent",size=1.5, linetype="solid")) + 
+  labs(y = "Density (genes)", x = "Proportion of reads assigned") + 
+  ggtitle("Proportion of reads assigned an allele (per-gene)") +
+  annotate("text", label = paste0("Genes: ", nrow(Proportion.df)), x = 0.75, y = 5)
+plot(p.dAssignment)
+
+ggsave(filename = "Project_Outputs/AlleleAssignmentProp_bygene_DEGs.jpeg",
+       plot = p.dAssignment,
+       device = "jpeg", dpi = 500,
+       width = 8, height = 6, units = "in", 
+       bg = "white")
+
+
+```
+
+
+Statistical tests to determine cis or trans modification
+```{r Cis/Trans, message=FALSE, warning=FALSE, include=FALSE}
+
+# P vs L (Parents); res.P0
+# Re-filter res.P0 so that filtered genes aren't excluded (causes dimension mismatches)
+res.filtered.P0 <- list()
+for (i in seq_along(res)) {
+  temp <- res[[i]]
+  temp$use <- temp$baseMean > metadata(temp)$filterThreshold
+  temp$filter <- ifelse(is.na(temp$padj), "ind_filtered", "Considered")
+  temp$filter <- ifelse(temp$baseMean == 0, "zero_filtered", temp$filter)
+  temp$significant <- (temp$padj < alpha_p & abs(temp$log2FoldChange) > log2(min_foldchange))
+  temp$GeneID <- rownames(temp)
+  #res.filtered.P0[[names(res)[i]]] <- temp[grepl("Considered", temp$filter) & temp$use, ]
+  res.filtered.P0[[names(res)[i]]] <- temp
+}
+
+
+
+### Allele-specific tests; res.AS
+
+Count.matrix.AS <- HL_allele_data[[1]][,1:2]
+for( i in 2:length(HL_allele_data)){
+  Count.matrix.AS <- cbind(Count.matrix.AS, HL_allele_data[[i]][1:2])
+}
+for(i in 1:length(HL_allele_data)){
+  colnames(Count.matrix.AS)[(i*2)-1] <- paste0(names(HL_allele_data)[i], ".P1")
+  colnames(Count.matrix.AS)[(i*2)] <- paste0(names(HL_allele_data)[i], ".P2")
+}
+# The HyLiTE imported count matrix has some other genes that Salmon discarded -- this may be reason enough to use HyLiTE's expression matrix for this part
+# Im going to bypass this by removing any gene from the HyLiTE matrix that isnt in the Salmon/TXimport matrix
+
+Count.matrix.AS <- Count.matrix.AS[rownames(Count.matrix.AS) %in% rownames(Count.Matrix.filter),]
+
+# P1 = Planktotrophs, P2 = Lecithotrophs (from HyLiTE protocol)
+# Make a metadata dataframe that is compatible with the metadata for the original samples so that they can be used in combination
+col.data.AS <- data.frame("sampleName" = sub(colnames(Count.matrix.AS), pattern = ".P1|.P2", replacement = ""),
+                          "Replicate" = NA,
+                          "crossID" = NA,
+                          "populationOrigin" = "allele",
+                          "Genotype" = rep(c("P", "L"), length(HL_allele_data)),
+                          "Generation" = "allele",
+                          "MaternalGenotype" = NA,
+                          "TissueType" = NA,
+                          "PooledCount" = NA,
+                          "Project" = "timecourse",
+                          "seq_Run" = NA,
+                          "seq_Lane" = NA,
+                          "fileName" = NA,
+                          "sampleID" = colnames(Count.matrix.AS),
+                          "multiFactor" = NA)
+for (i in 1:nrow(col.data.AS)) {
+  col.data.AS$TissueType[i] <- as.character(data.meta$TissueType[data.meta$sampleID == col.data.AS$sampleName[i]])
+}
+col.data.AS$multiFactor <- as.character(paste(col.data.AS$Genotype, col.data.AS$TissueType, sep = "_"))
+col.data.AS$Genotype <- factor(col.data.AS$Genotype, levels = c("P", "L"))
+col.data.AS$Generation <- factor(col.data.AS$Generation)
+col.data.AS$multiFactor <- factor(col.data.AS$multiFactor)
+
+
+DataSet.AS <- DESeqDataSetFromMatrix(countData = Count.matrix.AS, colData = col.data.AS, design = ~ multiFactor)
+dds.AS <- DESeq(DataSet.AS)
+
+res.AS <- list()
+# Individual time-point contrast between P and L Alleles (in the F1's)
+res.AS$sixteencell_PvL <- results(dds.AS, contrast = c("multiFactor", "L_16cell", "P_16cell"), alpha = alpha_p)
+res.AS$blastula_PvL <- results(dds.AS, contrast = c("multiFactor", "L_blastula", "P_blastula"), alpha = alpha_p)
+res.AS$gastrula_PvL <- results(dds.AS, contrast = c("multiFactor", "L_gastrula", "P_gastrula"), alpha = alpha_p)
+res.AS$prototroch_PvL <- results(dds.AS, contrast = c("multiFactor", "L_prototroch", "P_prototroch"), alpha = alpha_p)
+res.AS$swimming_PvL <- results(dds.AS, contrast = c("multiFactor", "L_swimming", "P_swimming"), alpha = alpha_p)
+res.AS$oneweek_PvL <- results(dds.AS, contrast = c("multiFactor", "L_1week", "P_1week"), alpha = alpha_p)
+
+# AS DESeq2 Results Filtering
+res.AS.filtered <- list()
+for (i in seq_along(res.AS)) {
+  temp <- res.AS[[i]]
+  temp$use <- temp$baseMean > metadata(temp)$filterThreshold
+  temp$filter <- ifelse(is.na(temp$padj), "ind_filtered", "Considered")
+  temp$filter <- ifelse(temp$baseMean == 0, "zero_filtered", temp$filter)
+  temp$significant <- (temp$padj < alpha_p & abs(temp$log2FoldChange) > log2(min_foldchange))
+  temp$GeneID <- rownames(temp)
+  #res.AS.filtered[[names(res.AS)[i]]] <- temp[grepl("Considered", temp$filter) & temp$use, ]
+  res.AS.filtered[[names(res.AS)[i]]] <- temp
+}
+
+# Cis-Trans Tests (DESeq2)
+
+col.data.ct <- rbind(data.meta.trim[,1:15], col.data.AS)
+col.data.ct$Genotype[col.data.ct$Genotype == "LL"] <- "L"
+col.data.ct$Genotype[col.data.ct$Genotype == "PP"] <- "P"
+col.data.ct$multiFactor <- as.character(paste(col.data.ct$Genotype, col.data.ct$TissueType, col.data.ct$Generation, sep = "_"))
+col.data.ct$Genotype <- factor(col.data.ct$Genotype)
+col.data.ct$Generation <- factor(col.data.ct$Generation)
+col.data.ct$TissueType <- factor(col.data.ct$TissueType)
+col.data.ct$multiFactor <- factor(col.data.ct$multiFactor)
+
+if(!any(!rownames(Count.matrix.AS) == rownames(Count.Matrix.filter))){
+  print("Count.Matrix.filter and Count.Matrix.AS have the same rownames!")
+  Count.matrix.ct <- cbind(Count.Matrix.filter, Count.matrix.AS)
+  rownames(col.data.ct) <- colnames(Count.matrix.ct)
+}
+
+Count.matrix.ct <- Count.matrix.ct[,colnames(Count.matrix.ct) %in% col.data.ct$sampleID[col.data.ct$Genotype != "PL" & col.data.ct$Genotype != "LP"]]
+col.data.ct <- col.data.ct[col.data.ct$sampleID[col.data.ct$Genotype != "PL" & col.data.ct$Genotype != "LP"],]
+
+DataSet.ct <- DESeqDataSetFromMatrix(countData = Count.matrix.ct, 
+                                     colData = col.data.ct, 
+                                     design = ~0 + TissueType:Genotype:Generation)
+dds.ct <- DESeq(DataSet.ct)
+resultsNames(dds.ct)
+
+res.ct <- list()
+res.ct$sixteencell_PvL <- results(dds.ct, name = "TissueType16cell.GenotypeL.Generationallele", alpha = 0.05)
+res.ct$blastula_PvL <- results(dds.ct, name = "TissueTypeblastula.GenotypeL.Generationallele", alpha = 0.05)
+res.ct$gastrula_PvL <- results(dds.ct, name = "TissueTypegastrula.GenotypeL.Generationallele", alpha = 0.05)
+res.ct$prototroch_PvL <- results(dds.ct, name = "TissueTypeprototroch.GenotypeL.Generationallele", alpha = 0.05)
+res.ct$swimming_PvL <- results(dds.ct, name = "TissueTypeswimming.GenotypeL.Generationallele", alpha = 0.05)
+res.ct$oneweek_PvL <- results(dds.ct, name = "TissueType1week.GenotypeL.Generationallele", alpha = 0.05)
+
+
+# Add annotations to all results (This method is very fast)
+if(all(rownames(Count.matrix.ct) %in% annotations.df$ID)){
+  temp <- annotations.df[annotations.df$ID %in% rownames(Count.matrix.ct),]
+  rownames(temp) <- temp$ID
+  temp <- data.frame("gene" = temp$gene, row.names = rownames(temp))
+  if(all( rownames(res.ct[[1]]) %in% rownames(temp)) ){
+    for(j in seq_along(res.ct)) {
+      res.ct[[j]]$annotation <- temp[match(rownames(res.ct[[j]]), rownames(temp)),]
+    }
+  }
+}
+
+# CT DESeq2 Results Filtering
+res.ct.filtered <- list()
+for (i in seq_along(res.ct)) {
+  temp <- res.ct[[i]]
+  temp$use <- temp$baseMean > metadata(temp)$filterThreshold
+  temp$filter <- ifelse(is.na(temp$padj), "ind_filtered", "Considered")
+  temp$filter <- ifelse(temp$baseMean == 0, "zero_filtered", temp$filter)
+  temp$significant <- (temp$padj < alpha_p & abs(temp$log2FoldChange) > log2(min_foldchange))
+  temp$GeneID <- rownames(temp)
+  #res.ct.filtered[[names(res.ct)[i]]] <- temp[grepl("Considered", temp$filter) & temp$use, ]
+  res.ct.filtered[[names(res.ct)[i]]] <- temp
+}
+
+```
+
+
+Summary of Cis/Trans modification results
+```{r Cis/Trans_summary}
+
+stages <- sub(names(res.ct), pattern = "_PPvLL|_PvL", replacement = "")
+gg.barplot.data.ls <- list()
+for(k in 1:6){
+select_stage <- stages[k]
+
+pct.t.summary <- data.frame("PvsL.padj" = res.filtered.P0[[paste0(select_stage,"_PPvLL")]]$padj,
+                            "PvsL.l2fc" = res.filtered.P0[[paste0(select_stage,"_PPvLL")]]$log2FoldChange,
+                            "P1vsP2.padj" = res.AS.filtered[[paste0(select_stage,"_PvL")]]$padj,
+                            "P1vsP2.l2fc" = res.AS.filtered[[paste0(select_stage,"_PvL")]]$log2FoldChange,
+                            "trans.padj" = res.ct.filtered[[paste0(select_stage,"_PvL")]]$padj,
+                            row.names = rownames(as.data.frame(res.filtered.P0[[paste0(select_stage,"_PPvLL")]])))
+pct.t.summary$l2fcRatio <- pct.t.summary$PvsL.l2fc/pct.t.summary$P1vsP2.l2fc
+
+pct.t.summary$Code.PvsL <- ifelse(is.na(pct.t.summary$PvsL.padj), 400, 
+                                    ifelse(pct.t.summary$PvsL.padj >= 0.1, 0, 
+                                           ifelse(pct.t.summary$PvsL.padj < 0.1 , 100, 500)))
+
+pct.t.summary$Code.P1vsP2 <- ifelse(is.na(pct.t.summary$P1vsP2.padj), 400,
+                                    ifelse(pct.t.summary$P1vsP2.padj >= 0.1, 0,
+                                           ifelse(pct.t.summary$P1vsP2.padj < 0.1, 10, 500)))
+
+pct.t.summary$Code.TransTest <- ifelse(is.na(pct.t.summary$trans.padj), 400,
+                                       ifelse(pct.t.summary$trans.padj >= 0.1, 0,
+                                              ifelse(pct.t.summary$trans.padj < 0.1 & pct.t.summary$l2fcRatio >1, 2,
+                                                     ifelse(pct.t.summary$trans.padj < 0.1 & pct.t.summary$l2fcRatio <1, 3, 500))))
+
+# Settings for Cis/Trans analyses
+code.Ambigous <- c(2,3,10,100)
+code.Compensatory <- c(12, 13)
+code.Conserved <- c(0)
+code.AllTrans <- c(102, 103)
+code.AllCis <- c(110)
+code.CisPlusTrans <- c(112)
+code.CisByTrans <- c(113)
+
+pct.t.summary$Codes <- rowSums(pct.t.summary[,7:9])
+pct.t.summary$ct.Mode <- ifelse(pct.t.summary$Codes %in% code.Ambigous, "Ambigous", 
+                                     ifelse(pct.t.summary$Codes %in% code.Compensatory, "Compensatory", 
+                                            ifelse(pct.t.summary$Codes %in% code.Conserved, "Conserved", 
+                                                   ifelse(pct.t.summary$Codes %in% code.AllTrans, "all trans", 
+                                                          ifelse(pct.t.summary$Codes %in% code.AllCis, "all cis", 
+                                                                 ifelse(pct.t.summary$Codes %in% code.CisPlusTrans, "cis + trans", 
+                                                                        ifelse(pct.t.summary$Codes %in% code.CisByTrans, "cis x trans", "Uninformative"
+                                                                        )))))))
+pct.t.summary$ID <- rownames(pct.t.summary)
+low.trans.id <- rownames(dds.ct[rowSums(counts(dds.ct)<3) >= 5, ])
+pct.t.summary[low.trans.id,]$ct.Mode <- "Uninformative"
+
+Mode.ct <- data.frame("ID" = pct.t.summary$ID,
+           "Mode" = pct.t.summary$ct.Mode)
+
+
+
+deg.Mode.ct <- Mode.ct
+# Apply filters from allele assignment rates (in previous code chunk)
+#deg.Mode.ct <- filter(Mode.ct, Mode.ct$ID %in% rownames(Proportion.df))
+deg.Mode.ct <- deg.Mode.ct[deg.Mode.ct$ID %in% Master_Res.df$GeneID[Master_Res.df$everDE],]
+
+
+# Assignments of genes only previously found to be DE between morphs
+CT.barplot.data <- data.frame("Ambigous" = nrow(deg.Mode.ct[deg.Mode.ct$Mode == "Ambigous",]),
+                           "Compensatory" = nrow(deg.Mode.ct[deg.Mode.ct$Mode == "Compensatory",]),
+                           "Conserved" = nrow(deg.Mode.ct[deg.Mode.ct$Mode == "Conserved",]),
+                           "all_trans" = nrow(deg.Mode.ct[deg.Mode.ct$Mode == "all trans",]),
+                           "all_cis" = nrow(deg.Mode.ct[deg.Mode.ct$Mode == "all cis",]),
+                           "cis_plus_trans" = nrow(deg.Mode.ct[deg.Mode.ct$Mode == "cis + trans",]),
+                           "cis_by_trans" = nrow(deg.Mode.ct[deg.Mode.ct$Mode == "cis x trans",]))
+                           #"Uninformative" = nrow(deg.Mode.ct[deg.Mode.ct$Mode == "Uninformative",]))
+
+gg.barplot.data.ls[[k]] <- data.frame("Mode" = c("Trans", "Cis", "Cis + Trans", "Cis x Trans"), #"Uninformative"),
+                              "n" = c(CT.barplot.data$all_trans,
+                                      CT.barplot.data$all_cis,
+                                      CT.barplot.data$cis_plus_trans,
+                                      CT.barplot.data$cis_by_trans))
+                                      #CT.barplot.data$Uninformative))
+gg.barplot.data.ls[[k]]$stage <- k
+}
+
+# Add regulatory Mode to Master Results data-frame --- ADJUST to AVERAGE MODE???
+for(i in 1:nrow(Mode.ct)){
+  GeneID <- Mode.ct$ID[i]
+  Master_Res.df$RegulatoryMode[grepl(pattern = GeneID, Master_Res.df$GeneID)] <- Mode.ct$Mode[i]
+}
+#Master_Res.df$RegulatoryMode[is.na(Master_Res.df$RegulatoryMode)] <- "Unknown"
+
+
+for( j in 1:length(gg.barplot.data.ls)) {
+  gg.barplot.data.ls[[j]]$total <- sum(gg.barplot.data.ls[[j]]$n)
+  gg.barplot.data.ls[[j]]$proportion <- gg.barplot.data.ls[[j]]$n/gg.barplot.data.ls[[j]]$total
+}
+
+gg.barplot.data <- do.call("rbind", gg.barplot.data.ls)
+
+count(Master_Res.df$RegulatoryMode %in% c("all trans", "all cis", "cis + trans", "cis x trans", "Compensatory", "Conserved"))
+
+CT.barplot <- ggplot(data = gg.barplot.data, aes(x = `stage`, y = `proportion`, fill = `Mode`)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_x_continuous(breaks = c(1,2,3,4,5,6), labels=c("16cell", "blastula", "gastrula", "prototroch", "swimming", "1week")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Mode of regulatory change of genes \nper developmental stage",
+      x = "Developmental Stage",
+      y = "Percent of assigned genes",
+      caption = "Assigned genes: 134") +
+  theme(text = element_text(size=20),
+        axis.title = element_text(size=20),
+        axis.text = element_text(size=18))
+
+
+ggsave(filename = "Project_Outputs/CisTransReg_modes_barplot.png",
+       plot = CT.barplot,
+       device = "png", dpi = 1200, width = 12, height = 8)
+
+
+```
+
+
+
+
+
+
+
+
+
+Test for enriched/over-represented GO terms in sets of genes of interest
+```{r GOenrichment}
+
+
+BiocManager::install("ALL")
+library("ALL")
+
+data(ALL)
+data(geneList)
+
+View(as.data.frame(geneList))
+
+
+
+# geneList = DEG gene names in rownames + p-values in a column "geneList"
+
+?topDiffGenes()
+
+
+new(Class = "topGOdata", description = "Sbene_GO_test", ontology = "BP", )
+
+
+
+
+
+?topGO::runTest
+
+
+
+
+
+
+
+
+
+
+```
+
+
+
+
+```{r}
+
+plot.geneTC("Sbene_G09231")
+
+
+
+```
+
+
+
+
