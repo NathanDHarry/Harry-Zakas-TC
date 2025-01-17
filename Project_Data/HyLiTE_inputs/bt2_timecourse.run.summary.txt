@@ -1,0 +1,8 @@
+Total number of child reads mapping on the reference:	400470161
+Number of child read unambiguously assigned to a parent:	93418555
+Number of child read unambiguously assigned to P1:	44780044
+Number of child read unambiguously assigned to P2:	48638511
+Number of child read with uninformative assignment:	280368696
+Number of child read with unknown or ambiguous assignement:	26682910
+Total number of SNPs identified:	1410226
+Total number of child unique SNPs:	977707
